@@ -1,0 +1,40 @@
+controller-ips:
+  - 127.0.0.1
+controller-port: 30035
+log-file: /var/log/deepflow-agent/deepflow-agent.log
+log-level: info
+
+static_config:
+  # eBPF 配置
+  ebpf:
+    enabled: true
+    socket:
+      uprobe:
+        tls:
+          enabled: true
+        golang:
+          enabled: true
+    profile:
+      on_cpu:
+        disabled: false
+        sampling_frequency: 99
+
+  # 采集网卡正则
+  tap_interface_regex: ^(eth.*|en.*|lo|veth.*)
+
+  # L7 协议解析
+  processors:
+    request_log:
+      application_protocol_inference:
+        enabled_protocols:
+          - HTTP
+          - HTTP2
+          - DNS
+          - TLS
+          - MySQL
+          - PostgreSQL
+          - Redis
+          - MongoDB
+          - Oracle
+          - Kafka
+          - Memcached

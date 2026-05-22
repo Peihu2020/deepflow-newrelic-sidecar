@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  deepflow-agent:
+    image: registry.cn-hongkong.aliyuncs.com/deepflow-ce/deepflow-agent:v6.6
+    container_name: deepflow-agent
+    restart: always
+    network_mode: "host"
+    pid: "host"
+    privileged: true
+    volumes:
+      - ./config/agent.yaml:/etc/agent.yaml:ro
+      - ./logs:/var/log/deepflow-agent
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - /sys/kernel/btf:/sys/kernel/btf:ro
+      - /sys/kernel/debug:/sys/kernel/debug:rw
+      - /proc:/host/proc:ro
+      - /:/host:ro
+    environment:
+      - CGROUPS_DISABLED=false
+    command: >
+      deepflow-agent --standalone -f /etc/agent.yaml
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  newrelic-sidecar:
+    image: deepflow-newrelic-sidecar:latest
+    container_name: deepflow-newrelic-sidecar
+    restart: always
+    depends_on:
+      - deepflow-agent
+    volumes:
+      - ./logs:/var/log/deepflow-agent
+      - ./.env:/app/.env:ro  # 关键：挂载 .env 文件到容器
+    environment:
+      - NEW_RELIC_LICENSE_KEY=${NEW_RELIC_LICENSE_KEY}
+      - NEW_RELIC_ACCOUNT_ID=${NEW_RELIC_ACCOUNT_ID}
+      - NEW_RELIC_APP_NAME=${NEW_RELIC_APP_NAME:-deepflow-agent}
+      - DEEPFLOW_LOG_DIR=/var/log/deepflow-agent
+      - BATCH_SIZE=${BATCH_SIZE:-100}
+      - FLUSH_INTERVAL=${FLUSH_INTERVAL:-5s}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - EVENT_TYPE_L7=${EVENT_TYPE_L7:-DeepFlowL7Log}
+      - EVENT_TYPE_L4=${EVENT_TYPE_L4:-DeepFlowL4Log}
+      - EVENT_TYPE_METRICS=${EVENT_TYPE_METRICS:-DeepFlowFlowMetrics}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "3"

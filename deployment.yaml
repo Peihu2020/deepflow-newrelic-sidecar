@@ -1,0 +1,138 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deepflow-agent-config
+  namespace: css-infra
+data:
+  agent.yaml: |
+    controller-ips:
+      - 127.0.0.1
+    controller-port: 30035
+    log-file: /var/log/deepflow-agent/deepflow-agent.log
+    log-level: info
+    static_config:
+      ebpf:
+        enabled: true
+      tap_interface_regex: ^(eth.*|en.*|lo)
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: newrelic-secret
+  namespace: css-infra
+type: Opaque
+stringData:
+  license_key: "27c4aebef854e3081ea258b1d152ee8eFFFFNRAL"
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: deepflow-sidecar
+  namespace: css-infra
+spec:
+  selector:
+    matchLabels:
+      app: deepflow-sidecar
+  template:
+    metadata:
+      labels:
+        app: deepflow-sidecar
+    spec:
+      hostPID: true
+      hostNetwork: true
+      containers:
+      # DeepFlow Agent 容器
+      - name: deepflow-agent
+        image: gzdctko-harbor.chowsangsang.com/css-infra/deepflow-agent-patch:v7.1.8
+        imagePullPolicy: Always
+        securityContext:
+          privileged: true
+        env:
+        - name: K8S_NODE_IP_FOR_DEEPFLOW
+          valueFrom:
+            fieldRef:
+              fieldPath: status.hostIP
+        volumeMounts:
+        - name: deepflow-config
+          mountPath: /etc/agent.yaml
+          subPath: agent.yaml
+          readOnly: true
+        - name: deepflow-logs
+          mountPath: /var/log/deepflow-agent
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys-kernel-debug
+          mountPath: /sys/kernel/debug
+        - name: sys-kernel-btf
+          mountPath: /sys/kernel/btf
+          readOnly: true
+        # 关键修正：参数必须分开
+        command:
+        - deepflow-agent
+        args:
+        - --standalone
+        - -f
+        - /etc/agent.yaml
+        resources:
+          limits:
+            cpu: "1"
+            memory: "1Gi"
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+      
+      # New Relic Sidecar 容器
+      - name: newrelic-sidecar
+        image: gzdctko-harbor.chowsangsang.com/css-infra/deepflow-newrelic-sidecar:1.1
+        imagePullPolicy: Always
+        env:
+        - name: NEW_RELIC_LICENSE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: newrelic-secret
+              key: license_key
+        - name: NEW_RELIC_ACCOUNT_ID
+          value: "4188218"
+        - name: NEW_RELIC_APP_NAME
+          value: "deepflow-agent"
+        - name: DEEPFLOW_LOG_DIR
+          value: "/var/log/deepflow-agent"
+        - name: BATCH_SIZE
+          value: "100"
+        - name: FLUSH_INTERVAL
+          value: "5s"
+        - name: LOG_LEVEL
+          value: "info"
+        - name: EVENT_TYPE_L7
+          value: "DeepFlowL7Log"
+        - name: EVENT_TYPE_L4
+          value: "DeepFlowL4Log"
+        - name: EVENT_TYPE_METRICS
+          value: "DeepFlowFlowMetrics"
+        volumeMounts:
+        - name: deepflow-logs
+          mountPath: /var/log/deepflow-agent
+        resources:
+          limits:
+            cpu: "200m"
+            memory: "256Mi"
+          requests:
+            cpu: "50m"
+            memory: "64Mi"
+      
+      volumes:
+      - name: deepflow-config
+        configMap:
+          name: deepflow-agent-config
+      - name: deepflow-logs
+        emptyDir: {}
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys-kernel-debug
+        hostPath:
+          path: /sys/kernel/debug
+      - name: sys-kernel-btf
+        hostPath:
+          path: /sys/kernel/btf
