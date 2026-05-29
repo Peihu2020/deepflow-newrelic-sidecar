@@ -39,31 +39,26 @@ type Config struct {
 	EventTypeL7       string
 	EventTypeL4       string
 	EventTypeMetrics  string
-	Hostname          string // 添加 hostname 字段
+	Hostname          string
 }
 
 // 日志处理器
 type LogProcessor struct {
-	config        Config
-	logWatchers   map[string]*LogWatcher
-	offsetManager *OffsetManager
-	nrClient      *NewRelicClient
-	mu            sync.RWMutex
-	stopCh        chan struct{}
-	wg            sync.WaitGroup
-	hostname      string // 缓存 hostname
+	config      Config
+	logWatchers map[string]*LogWatcher
+	nrClient    *NewRelicClient
+	mu          sync.RWMutex
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
+	hostname    string
 }
 
 // 文件监听器
 type LogWatcher struct {
-	filePath      string
-	file          *os.File
-	reader        *bufio.Reader
-	lastOffset    int64
-	processor     *LogProcessor
-	offsetManager *OffsetManager
-	mu            sync.Mutex
-	logType       string
+	filePath  string
+	file      *os.File
+	processor *LogProcessor
+	logType   string
 }
 
 // 批量发送器
@@ -74,8 +69,6 @@ type BatchSender struct {
 	processor *LogProcessor
 	logType   string
 }
-
-var errTimeout = fmt.Errorf("timeout")
 
 func main() {
 	// 加载 .env 文件
@@ -119,32 +112,22 @@ func main() {
 	log.Printf("  Log Directory: %s", config.LogDir)
 	log.Printf("  Batch Size: %d", config.BatchSize)
 	log.Printf("  Flush Interval: %v", config.FlushInterval)
-	log.Printf("  Log Level: %s", config.LogLevel)
-	log.Printf("  Event Types: L7=%s, L4=%s, Metrics=%s", config.EventTypeL7, config.EventTypeL4, config.EventTypeMetrics)
 
 	// 确保日志目录存在
 	if err := os.MkdirAll(config.LogDir, 0755); err != nil {
 		log.Fatalf("Failed to create log directory: %v", err)
 	}
 
-	// 创建偏移量管理器 - 使用 /tmp 目录存储 .offsets.json
-	offsetFilePath := filepath.Join("/tmp", "deepflow-sidecar-offsets.json")
-	offsetManager := NewOffsetManager(offsetFilePath)
-	defer offsetManager.Stop()
-
-	log.Printf("Offset file stored at: %s", offsetFilePath)
-
 	// 创建 New Relic 客户端
 	nrClient := NewNewRelicClient(config.NewRelicLicense, config.NewRelicAccountID, false)
 
 	// 创建日志处理器
 	processor := &LogProcessor{
-		config:        config,
-		logWatchers:   make(map[string]*LogWatcher),
-		offsetManager: offsetManager,
-		nrClient:      nrClient,
-		stopCh:        make(chan struct{}),
-		hostname:      hostname,
+		config:      config,
+		logWatchers: make(map[string]*LogWatcher),
+		nrClient:    nrClient,
+		stopCh:      make(chan struct{}),
+		hostname:    hostname,
 	}
 
 	// 初始化批量发送器
@@ -184,58 +167,86 @@ func main() {
 		sender.Start()
 	}
 
-	// 监听信号
+	// 启动 .pre 文件清理协程（每分钟扫描并删除）
+	processor.wg.Add(1)
+	go processor.cleanupPreFiles()
+
+	// 监听退出信号（支持 Ctrl+C）
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
+	log.Println("========================================")
 	log.Println("DeepFlow New Relic Sidecar started")
 	log.Printf("Watching directory: %s", config.LogDir)
+	log.Println("Press Ctrl+C to stop")
+	log.Println("========================================")
 
 	// 等待停止信号
 	<-sigCh
-	log.Println("Shutting down...")
+	log.Println("\nReceived shutdown signal, stopping...")
 	processor.Stop()
+	log.Println("Sidecar stopped successfully")
 }
 
-// getBaseName removes .pre suffix only, keeps .log files
-func getBaseName(fileName string) string {
-	baseName := fileName
-
-	// Only remove .pre suffix (with dot)
-	// Do NOT remove .log - we want to process .log files
-	baseName = strings.TrimSuffix(baseName, ".pre")
-
-	return baseName
-}
-
-// deletePreFile deletes a .pre file
-func deletePreFile(logDir, fileName string) {
-	filePath := filepath.Join(logDir, fileName)
-	if err := os.Remove(filePath); err != nil {
-		if !os.IsNotExist(err) {
-			log.Printf("Failed to delete .pre file %s: %v", filePath, err)
-		}
-	} else {
-		log.Printf("Deleted .pre file: %s", filePath)
-	}
-}
-
-// shouldSkipFile checks if the file should be ignored and deletes .pre files
-func shouldSkipFile(logDir, fileName string) bool {
-	// Skip offset files
-	if fileName == ".offsets.json" || fileName == ".offsets.json.tmp" {
-		return true
-	}
-
-	// Skip and DELETE .pre files
+// shouldSkipFile 检查是否应该跳过文件
+func shouldSkipFile(fileName string) bool {
+	// 跳过 .pre 文件（不监控，让清理线程删除）
 	if strings.HasSuffix(fileName, ".pre") {
-		log.Printf("Found .pre file, deleting: %s", fileName)
-		go deletePreFile(logDir, fileName)
 		return true
 	}
-
-	// Keep .log files - they will be processed
 	return false
+}
+
+// cleanupPreFiles 定期清理 .pre 文件（每分钟扫描，发现即删除）
+func (p *LogProcessor) cleanupPreFiles() {
+	defer p.wg.Done()
+
+	// 每 1 分钟检查一次
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	// 启动时立即执行一次清理
+	p.doCleanupPreFiles()
+
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-ticker.C:
+			p.doCleanupPreFiles()
+		}
+	}
+}
+
+// doCleanupPreFiles 执行实际的清理操作（发现 .pre 文件立即删除）
+func (p *LogProcessor) doCleanupPreFiles() {
+	// 查找所有 .pre 文件
+	pattern := filepath.Join(p.config.LogDir, "*.pre")
+	files, err := filepath.Glob(pattern)
+	if err != nil {
+		log.Printf("Error finding .pre files: %v", err)
+		return
+	}
+
+	if len(files) == 0 {
+		return
+	}
+
+	deletedCount := 0
+	for _, filePath := range files {
+		if err := os.Remove(filePath); err != nil {
+			if !os.IsNotExist(err) {
+				log.Printf("Failed to delete .pre file %s: %v", filePath, err)
+			}
+		} else {
+			log.Printf("Deleted .pre file: %s", filePath)
+			deletedCount++
+		}
+	}
+
+	if deletedCount > 0 {
+		log.Printf("Cleaned up %d .pre files", deletedCount)
+	}
 }
 
 func (p *LogProcessor) processExistingFiles(batchSenders map[string]*BatchSender) {
@@ -253,19 +264,14 @@ func (p *LogProcessor) processExistingFiles(batchSenders map[string]*BatchSender
 		}
 
 		fileName := entry.Name()
-
-		// Skip unwanted files (.pre, .offsets, etc.) and delete .pre files
-		if shouldSkipFile(p.config.LogDir, fileName) {
+		if shouldSkipFile(fileName) {
 			continue
 		}
 
-		baseName := getBaseName(fileName)
-		log.Printf("File: %s -> BaseName: %s", fileName, baseName)
-
-		// Check for both .log and non-.log files
-		if baseName == "l7_flow_log" || baseName == "l4_flow_log" || baseName == "flow_metrics" {
+		// 只处理 .log 文件
+		if fileName == "l7_flow_log" || fileName == "l4_flow_log" || fileName == "flow_metrics" {
 			filePath := filepath.Join(p.config.LogDir, fileName)
-			log.Printf("Found existing file: %s (type: %s)", filePath, baseName)
+			log.Printf("Found existing file: %s", filePath)
 			p.watchFile(filePath, batchSenders)
 		}
 	}
@@ -284,16 +290,11 @@ func (p *LogProcessor) watchEvents(watcher *fsnotify.Watcher, batchSenders map[s
 				time.Sleep(100 * time.Millisecond)
 
 				fileName := filepath.Base(event.Name)
-
-				// Skip unwanted files (.pre, .offsets, etc.) and delete .pre files
-				if shouldSkipFile(p.config.LogDir, fileName) {
+				if shouldSkipFile(fileName) {
 					continue
 				}
 
-				baseName := getBaseName(fileName)
-				log.Printf("New file detected: %s -> BaseName: %s", fileName, baseName)
-
-				if baseName == "l7_flow_log" || baseName == "l4_flow_log" || baseName == "flow_metrics" {
+				if fileName == "l7_flow_log" || fileName == "l4_flow_log" || fileName == "flow_metrics" {
 					log.Printf("Detected new file: %s", event.Name)
 					p.watchFile(event.Name, batchSenders)
 				}
@@ -308,19 +309,9 @@ func (p *LogProcessor) watchEvents(watcher *fsnotify.Watcher, batchSenders map[s
 }
 
 func (p *LogProcessor) watchFile(filePath string, batchSenders map[string]*BatchSender) {
-	fileName := filepath.Base(filePath)
-	baseName := getBaseName(fileName)
-
-	var logType string
-	switch baseName {
-	case "l7_flow_log":
-		logType = LogTypeL7Flow
-	case "l4_flow_log":
-		logType = LogTypeL4Flow
-	case "flow_metrics":
-		logType = LogTypeFlowMetrics
-	default:
-		log.Printf("Unknown log type for file: %s (baseName: %s)", filePath, baseName)
+	// 跳过 .pre 文件
+	if strings.HasSuffix(filePath, ".pre") {
+		log.Printf("Skipping .pre file: %s", filePath)
 		return
 	}
 
@@ -331,27 +322,25 @@ func (p *LogProcessor) watchFile(filePath string, batchSenders map[string]*Batch
 	}
 	p.mu.Unlock()
 
-	log.Printf("Watching file: %s (type: %s)", filePath, logType)
-
-	// 【修复1】验证保存的偏移量是否有效
-	fileInfo, err := os.Stat(filePath)
-	if err == nil {
-		currentSize := fileInfo.Size()
-		savedOffset := p.offsetManager.GetOffset(filePath)
-
-		// 如果保存的偏移量大于当前文件大小，说明是旧文件的无效偏移量
-		if savedOffset > currentSize {
-			log.Printf("WARNING: Saved offset %d exceeds file size %d for %s, resetting to 0",
-				savedOffset, currentSize, filePath)
-			p.offsetManager.SetOffset(filePath, 0)
-		}
+	var logType string
+	switch filepath.Base(filePath) {
+	case "l7_flow_log":
+		logType = LogTypeL7Flow
+	case "l4_flow_log":
+		logType = LogTypeL4Flow
+	case "flow_metrics":
+		logType = LogTypeFlowMetrics
+	default:
+		log.Printf("Unknown log type for file: %s", filePath)
+		return
 	}
 
+	log.Printf("Watching file: %s (type: %s)", filePath, logType)
+
 	watcher := &LogWatcher{
-		filePath:      filePath,
-		processor:     p,
-		offsetManager: p.offsetManager,
-		logType:       logType,
+		filePath:  filePath,
+		processor: p,
+		logType:   logType,
 	}
 
 	p.mu.Lock()
@@ -365,18 +354,20 @@ func (p *LogProcessor) watchFile(filePath string, batchSenders map[string]*Batch
 func (p *LogProcessor) Stop() {
 	close(p.stopCh)
 	p.wg.Wait()
-	log.Println("DeepFlow New Relic Sidecar stopped")
+	log.Println("All goroutines stopped")
 }
 
+// tailFile - 首次启动从开头读取，然后切换到 tail 模式
 func (w *LogWatcher) tailFile(sender *BatchSender) {
 	defer w.processor.wg.Done()
+
+	// 标记是否是第一次运行
+	isFirstRun := true
 
 	for {
 		select {
 		case <-w.processor.stopCh:
 			if w.file != nil {
-				offset, _ := w.file.Seek(0, io.SeekCurrent)
-				w.offsetManager.SetOffset(w.filePath, offset)
 				w.file.Close()
 			}
 			return
@@ -393,138 +384,48 @@ func (w *LogWatcher) tailFile(sender *BatchSender) {
 				continue
 			}
 
-			// 【修复2】获取文件大小并验证偏移量
-			stat, err := file.Stat()
-			if err != nil {
-				log.Printf("Error getting file stat: %v", err)
-				file.Close()
-				time.Sleep(1 * time.Second)
-				continue
-			}
-			fileSize := stat.Size()
-
-			savedOffset := w.offsetManager.GetOffset(w.filePath)
-
-			var offset int64
-			if savedOffset > 0 && savedOffset <= fileSize {
-				// 有效偏移量，从该位置继续
-				offset = savedOffset
-				log.Printf("Resuming file %s from offset %d (file size: %d)", w.filePath, offset, fileSize)
-			} else if savedOffset > fileSize {
-				// 无效偏移量（大于文件大小），重置为 0
-				offset = 0
-				log.Printf("WARNING: Saved offset %d > file size %d, resetting to 0 for %s",
-					savedOffset, fileSize, w.filePath)
-				w.offsetManager.SetOffset(w.filePath, 0)
-			} else {
-				// 从头开始
-				offset = 0
-				log.Printf("Starting from BEGINNING of file: %s (size: %d)", w.filePath, fileSize)
-			}
-
-			if _, err := file.Seek(offset, io.SeekStart); err != nil {
-				log.Printf("Error seeking to offset %d: %v", offset, err)
-				file.Close()
-				time.Sleep(1 * time.Second)
-				continue
-			}
-
-			w.lastOffset = offset
-			w.file = file
-			w.reader = bufio.NewReader(file)
-
-			log.Printf("File %s opened, size: %d bytes, starting at offset: %d", w.filePath, fileSize, offset)
-		}
-
-		if err := w.readWithTimeout(sender); err != nil {
-			if err == errTimeout {
-				currentOffset, _ := w.file.Seek(0, io.SeekCurrent)
-				if currentOffset != w.lastOffset {
-					w.offsetManager.SetOffset(w.filePath, currentOffset)
-					w.lastOffset = currentOffset
-				}
-				continue
-			}
-			if err == io.EOF {
-				if w.checkFileRotation() {
+			if isFirstRun {
+				// 第一次启动：从文件开头读取所有现有内容
+				if _, err := file.Seek(0, io.SeekStart); err != nil {
+					log.Printf("Error seeking to start: %v", err)
+					file.Close()
+					time.Sleep(1 * time.Second)
 					continue
 				}
-				currentOffset, _ := w.file.Seek(0, io.SeekCurrent)
-				if currentOffset != w.lastOffset {
-					w.offsetManager.SetOffset(w.filePath, currentOffset)
-					w.lastOffset = currentOffset
+				log.Printf("First run: reading %s from beginning", w.filePath)
+				isFirstRun = false
+			} else {
+				// 后续：从文件末尾开始 tail
+				if _, err := file.Seek(0, io.SeekEnd); err != nil {
+					log.Printf("Error seeking to end: %v", err)
+					file.Close()
+					time.Sleep(1 * time.Second)
+					continue
 				}
-				time.Sleep(100 * time.Millisecond)
-				continue
+				log.Printf("Tailing file: %s", w.filePath)
 			}
-			log.Printf("Error reading file: %v", err)
-			w.file.Close()
-			w.file = nil
-			time.Sleep(1 * time.Second)
-			continue
+
+			w.file = file
 		}
-	}
-}
 
-func (w *LogWatcher) readWithTimeout(sender *BatchSender) error {
-	type result struct {
-		line []byte
-		err  error
-	}
-
-	ch := make(chan result, 1)
-	go func() {
-		line, err := w.reader.ReadBytes('\n')
-		ch <- result{line, err}
-	}()
-
-	select {
-	case res := <-ch:
-		if res.err != nil {
-			return res.err
+		// 读取新行
+		reader := bufio.NewReader(w.file)
+		for {
+			line, err := reader.ReadBytes('\n')
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				log.Printf("Error reading file %s: %v", w.filePath, err)
+				w.file.Close()
+				w.file = nil
+				break
+			}
+			w.processLine(line, sender)
 		}
-		w.processLine(res.line, sender)
-		return nil
-	case <-time.After(5 * time.Second):
-		return errTimeout
+
+		time.Sleep(100 * time.Millisecond)
 	}
-}
-
-func (w *LogWatcher) checkFileRotation() bool {
-	newFile, err := os.Open(w.filePath)
-	if err != nil {
-		return false
-	}
-	defer newFile.Close()
-
-	oldInfo, err1 := w.file.Stat()
-	newInfo, err2 := newFile.Stat()
-
-	if err1 != nil || err2 != nil {
-		return false
-	}
-
-	if os.SameFile(oldInfo, newInfo) {
-		return false
-	}
-
-	// 【修复3】文件已轮转，保存当前进度后关闭旧文件
-	currentOffset, _ := w.file.Seek(0, io.SeekCurrent)
-
-	// 注意：保存的是旧文件的偏移量，但新文件需要从 0 开始
-	// 所以这里保存偏移量但不立即使用，等待新文件打开时验证
-	w.offsetManager.SetOffset(w.filePath, currentOffset)
-	w.file.Close()
-	w.file = nil
-
-	log.Printf("File rotated: %s, saved offset %d for old file, will start new file from beginning",
-		w.filePath, currentOffset)
-
-	// 【修复4】立即将偏移量重置为 0，让新文件从头开始
-	// 这样可以避免新文件打开时读到旧的偏移量
-	w.offsetManager.SetOffset(w.filePath, 0)
-
-	return true
 }
 
 func (w *LogWatcher) processLine(line []byte, sender *BatchSender) {
@@ -553,17 +454,16 @@ func (w *LogWatcher) processLine(line []byte, sender *BatchSender) {
 		eventTypeName = getEnv("EVENT_TYPE_DEFAULT", "DeepFlowLog")
 	}
 
-	// 构建 New Relic 事件 - 展开所有字段，不保存 raw_log
+	// 构建 New Relic 事件
 	nrEvent := map[string]interface{}{
 		"timestamp": time.Now().Unix(),
 		"eventType": eventTypeName,
 		"log_type":  w.logType,
-		"hostname":  w.processor.hostname, // 添加 hostname 字段
+		"hostname":  w.processor.hostname,
 	}
 
-	// ========== 展开 rawData 中的所有字段到顶层 ==========
+	// 展开 rawData 中的所有字段
 	for key, value := range rawData {
-		// 跳过已经处理过的字段
 		if key == "eventType" || key == "timestamp" {
 			continue
 		}
@@ -573,31 +473,26 @@ func (w *LogWatcher) processLine(line []byte, sender *BatchSender) {
 			if meter, ok := value.(map[string]interface{}); ok {
 				// 处理 Flow 指标
 				if flow, ok := meter["Flow"].(map[string]interface{}); ok {
-					// 展开 traffic 子字段
 					if traffic, ok := flow["traffic"].(map[string]interface{}); ok {
 						for k, v := range traffic {
 							nrEvent["traffic_"+k] = v
 						}
 					}
-					// 展开 latency 子字段
 					if latency, ok := flow["latency"].(map[string]interface{}); ok {
 						for k, v := range latency {
 							nrEvent["latency_"+k] = v
 						}
 					}
-					// 展开 performance 子字段
 					if perf, ok := flow["performance"].(map[string]interface{}); ok {
 						for k, v := range perf {
 							nrEvent["performance_"+k] = v
 						}
 					}
-					// 展开 anomaly 子字段
 					if anomaly, ok := flow["anomaly"].(map[string]interface{}); ok {
 						for k, v := range anomaly {
 							nrEvent["anomaly_"+k] = v
 						}
 					}
-					// flow_load 指标
 					if flowLoad, ok := flow["flow_load"].(map[string]interface{}); ok {
 						for k, v := range flowLoad {
 							nrEvent["flow_load_"+k] = v
@@ -630,17 +525,14 @@ func (w *LogWatcher) processLine(line []byte, sender *BatchSender) {
 		if key == "tagger" {
 			if tagger, ok := value.(map[string]interface{}); ok {
 				for k, v := range tagger {
-					// 跳过 code 字段（太大且不常用）
 					if k == "code" {
 						continue
 					}
-					// 处理 mac 数组
-					if k == "mac" || k == "mac1" {
-						if macArr, ok := v.([]interface{}); ok && len(macArr) >= 3 {
-							nrEvent[k] = fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
-								toByte(macArr[0]), toByte(macArr[1]), toByte(macArr[2]),
-								toByte(macArr[3]), toByte(macArr[4]), toByte(macArr[5]))
-						}
+					if (k == "mac" || k == "mac1") && len(v.([]interface{})) >= 3 {
+						macArr := v.([]interface{})
+						nrEvent[k] = fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
+							toByte(macArr[0]), toByte(macArr[1]), toByte(macArr[2]),
+							toByte(macArr[3]), toByte(macArr[4]), toByte(macArr[5]))
 						continue
 					}
 					nrEvent["tagger_"+k] = v
@@ -649,37 +541,30 @@ func (w *LogWatcher) processLine(line []byte, sender *BatchSender) {
 			continue
 		}
 
-		// ========== 新增：处理 trace_ids 数组 ==========
+		// 处理 trace_ids 数组
 		if key == "trace_ids" {
 			if traceIDs, ok := value.([]interface{}); ok && len(traceIDs) > 0 {
-				// 如果有多个 trace_id，取第一个（通常只有一个）
-				if len(traceIDs) > 0 {
-					if traceID, ok := traceIDs[0].(string); ok {
-						nrEvent["trace_id"] = traceID
-					}
+				if traceID, ok := traceIDs[0].(string); ok {
+					nrEvent["trace_id"] = traceID
 				}
-				// 也可以保存整个数组
 				nrEvent["trace_ids"] = value
 			}
 			continue
 		}
 
-		// ========== 新增：处理 attributes 嵌套对象 ==========
+		// 处理 attributes 嵌套对象
 		if key == "attributes" {
 			if attrs, ok := value.(map[string]interface{}); ok {
-				// 提取 apm_trace_id（备份字段）
 				if apmTraceID, ok := attrs["apm_trace_id"].(string); ok {
 					nrEvent["apm_trace_id"] = apmTraceID
 				}
-				// 提取原始的 traceparent 头
 				if traceparent, ok := attrs["traceparent"].(string); ok {
 					nrEvent["traceparent"] = traceparent
 				}
-				// 提取其他 attributes 字段
 				for k, v := range attrs {
 					switch k {
 					case "apm_trace_id", "traceparent":
-						// 已经处理过了
+						continue
 					default:
 						nrEvent["attr_"+k] = v
 					}
