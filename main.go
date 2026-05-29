@@ -39,6 +39,7 @@ type Config struct {
 	EventTypeL7       string
 	EventTypeL4       string
 	EventTypeMetrics  string
+	Hostname          string // 添加 hostname 字段
 }
 
 // 日志处理器
@@ -50,6 +51,7 @@ type LogProcessor struct {
 	mu            sync.RWMutex
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
+	hostname      string // 缓存 hostname
 }
 
 // 文件监听器
@@ -81,6 +83,14 @@ func main() {
 		log.Printf("Warning: No .env file found, using environment variables")
 	}
 
+	// 获取主机名
+	hostname, err := os.Hostname()
+	if err != nil {
+		log.Printf("Warning: Failed to get hostname: %v, using 'unknown'", err)
+		hostname = "unknown"
+	}
+	log.Printf("Hostname: %s", hostname)
+
 	// 从环境变量读取配置
 	config := Config{
 		LogDir:            getEnv("DEEPFLOW_LOG_DIR", "/var/log/deepflow-agent"),
@@ -94,6 +104,7 @@ func main() {
 		EventTypeL7:       getEnv("EVENT_TYPE_L7", "DeepFlowL7Log"),
 		EventTypeL4:       getEnv("EVENT_TYPE_L4", "DeepFlowL4Log"),
 		EventTypeMetrics:  getEnv("EVENT_TYPE_METRICS", "DeepFlowFlowMetrics"),
+		Hostname:          hostname,
 	}
 
 	// 验证必需配置
@@ -102,6 +113,7 @@ func main() {
 	}
 
 	log.Printf("Configuration loaded:")
+	log.Printf("  Hostname: %s", config.Hostname)
 	log.Printf("  New Relic License: %s...", config.NewRelicLicense[:8])
 	log.Printf("  New Relic Account ID: %s", config.NewRelicAccountID)
 	log.Printf("  Log Directory: %s", config.LogDir)
@@ -132,6 +144,7 @@ func main() {
 		offsetManager: offsetManager,
 		nrClient:      nrClient,
 		stopCh:        make(chan struct{}),
+		hostname:      hostname,
 	}
 
 	// 初始化批量发送器
@@ -505,6 +518,7 @@ func (w *LogWatcher) processLine(line []byte, sender *BatchSender) {
 		"timestamp": time.Now().Unix(),
 		"eventType": eventTypeName,
 		"log_type":  w.logType,
+		"hostname":  w.processor.hostname, // 添加 hostname 字段
 	}
 
 	// ========== 展开 rawData 中的所有字段到顶层 ==========

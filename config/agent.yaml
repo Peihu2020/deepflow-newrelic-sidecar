@@ -5,7 +5,6 @@ log-file: /var/log/deepflow-agent/deepflow-agent.log
 log-level: info
 
 static_config:
-  # eBPF 配置
   ebpf:
     enabled: true
     socket:
@@ -19,11 +18,16 @@ static_config:
         disabled: true
         sampling_frequency: 99
 
-  # 采集网卡正则
   tap_interface_regex: ^(eth.*|en.*|lo|veth.*)
-
+inputs:
+  ebpf:
+    socket:
+      tunning:
+        syscall_trace_id_disabled: false
 processors:
   request_log:
+    tunning:
+      payload_truncation: 16384   # 从 1024 改为 16384 (16KB)
     application_protocol_inference:
         enabled_protocols:
           - HTTP
@@ -39,11 +43,7 @@ processors:
           - Memcached
     tag_extraction:
       tracing_tag:
-        # Enable multiple TraceID collection (collect all matching TraceIDs)
         multiple_trace_id_collection: true
-        
-        # Extract TraceID from common tracing headers
-        # The agent will try these in order until a match is found
         apm_trace_id:
           - traceparent      # W3C Trace Context: 00-TRACEID-SPANID-01
           - sw8              # SkyWalking v8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
@@ -53,8 +53,6 @@ processors:
           - b3               # Zipkin B3: TRACEID-SPANID-1
           - X-B3-TraceId     # Alternative B3 header format
           - X-Request-Id     # Common request ID header
-          
-        # Extract SpanID from HTTP headers
         apm_span_id:
           - traceparent      # W3C format: 00-TRACEID-SPANID-01
           - sw8              # SkyWalking v8 format
@@ -62,22 +60,14 @@ processors:
           - uber-trace-id    # Jaeger format
           - b3               # Zipkin B3 format: TRACEID-SPANID-1
           - X-B3-SpanId      # Alternative B3 header format
-          
-        # Extract HTTP real client IP (for proxy scenarios)
         http_real_client:
           - X_Forwarded_For
           - X-Real-IP
           - True-Client-IP
-          
-        # Extract X-Request-ID for request correlation
         x_request_id:
           - X_Request_ID
           - X-Request-Id
-          
-        # Copy APM TraceID to attribute.apm_trace_id field
         copy_apm_trace_id: true
-        
-        # Extract custom HTTP headers (if needed)
       custom_fields:
         HTTP:
           - field_name: "traceparent"
