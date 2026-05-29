@@ -595,6 +595,45 @@ func (w *LogWatcher) processLine(line []byte, sender *BatchSender) {
 			continue
 		}
 
+		// ========== 新增：处理 trace_ids 数组 ==========
+		if key == "trace_ids" {
+			if traceIDs, ok := value.([]interface{}); ok && len(traceIDs) > 0 {
+				// 如果有多个 trace_id，取第一个（通常只有一个）
+				if len(traceIDs) > 0 {
+					if traceID, ok := traceIDs[0].(string); ok {
+						nrEvent["trace_id"] = traceID
+					}
+				}
+				// 也可以保存整个数组
+				nrEvent["trace_ids"] = value
+			}
+			continue
+		}
+
+		// ========== 新增：处理 attributes 嵌套对象 ==========
+		if key == "attributes" {
+			if attrs, ok := value.(map[string]interface{}); ok {
+				// 提取 apm_trace_id（备份字段）
+				if apmTraceID, ok := attrs["apm_trace_id"].(string); ok {
+					nrEvent["apm_trace_id"] = apmTraceID
+				}
+				// 提取原始的 traceparent 头
+				if traceparent, ok := attrs["traceparent"].(string); ok {
+					nrEvent["traceparent"] = traceparent
+				}
+				// 提取其他 attributes 字段
+				for k, v := range attrs {
+					switch k {
+					case "apm_trace_id", "traceparent":
+						// 已经处理过了
+					default:
+						nrEvent["attr_"+k] = v
+					}
+				}
+			}
+			continue
+		}
+
 		// 普通字段直接添加
 		nrEvent[key] = value
 	}
