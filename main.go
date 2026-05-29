@@ -333,6 +333,20 @@ func (p *LogProcessor) watchFile(filePath string, batchSenders map[string]*Batch
 
 	log.Printf("Watching file: %s (type: %s)", filePath, logType)
 
+	// 【修复1】验证保存的偏移量是否有效
+	fileInfo, err := os.Stat(filePath)
+	if err == nil {
+		currentSize := fileInfo.Size()
+		savedOffset := p.offsetManager.GetOffset(filePath)
+
+		// 如果保存的偏移量大于当前文件大小，说明是旧文件的无效偏移量
+		if savedOffset > currentSize {
+			log.Printf("WARNING: Saved offset %d exceeds file size %d for %s, resetting to 0",
+				savedOffset, currentSize, filePath)
+			p.offsetManager.SetOffset(filePath, 0)
+		}
+	}
+
 	watcher := &LogWatcher{
 		filePath:      filePath,
 		processor:     p,
@@ -379,15 +393,33 @@ func (w *LogWatcher) tailFile(sender *BatchSender) {
 				continue
 			}
 
+			// 【修复2】获取文件大小并验证偏移量
+			stat, err := file.Stat()
+			if err != nil {
+				log.Printf("Error getting file stat: %v", err)
+				file.Close()
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			fileSize := stat.Size()
+
 			savedOffset := w.offsetManager.GetOffset(w.filePath)
 
 			var offset int64
-			if savedOffset > 0 {
+			if savedOffset > 0 && savedOffset <= fileSize {
+				// 有效偏移量，从该位置继续
 				offset = savedOffset
-				log.Printf("Resuming file %s from offset %d", w.filePath, offset)
-			} else {
+				log.Printf("Resuming file %s from offset %d (file size: %d)", w.filePath, offset, fileSize)
+			} else if savedOffset > fileSize {
+				// 无效偏移量（大于文件大小），重置为 0
 				offset = 0
-				log.Printf("Starting from BEGINNING of file: %s", w.filePath)
+				log.Printf("WARNING: Saved offset %d > file size %d, resetting to 0 for %s",
+					savedOffset, fileSize, w.filePath)
+				w.offsetManager.SetOffset(w.filePath, 0)
+			} else {
+				// 从头开始
+				offset = 0
+				log.Printf("Starting from BEGINNING of file: %s (size: %d)", w.filePath, fileSize)
 			}
 
 			if _, err := file.Seek(offset, io.SeekStart); err != nil {
@@ -401,9 +433,7 @@ func (w *LogWatcher) tailFile(sender *BatchSender) {
 			w.file = file
 			w.reader = bufio.NewReader(file)
 
-			if stat, err := file.Stat(); err == nil {
-				log.Printf("File %s opened, size: %d bytes, starting at offset: %d", w.filePath, stat.Size(), offset)
-			}
+			log.Printf("File %s opened, size: %d bytes, starting at offset: %d", w.filePath, fileSize, offset)
 		}
 
 		if err := w.readWithTimeout(sender); err != nil {
@@ -478,12 +508,22 @@ func (w *LogWatcher) checkFileRotation() bool {
 		return false
 	}
 
+	// 【修复3】文件已轮转，保存当前进度后关闭旧文件
 	currentOffset, _ := w.file.Seek(0, io.SeekCurrent)
+
+	// 注意：保存的是旧文件的偏移量，但新文件需要从 0 开始
+	// 所以这里保存偏移量但不立即使用，等待新文件打开时验证
 	w.offsetManager.SetOffset(w.filePath, currentOffset)
 	w.file.Close()
 	w.file = nil
 
-	log.Printf("File rotated: %s, saved offset %d", w.filePath, currentOffset)
+	log.Printf("File rotated: %s, saved offset %d for old file, will start new file from beginning",
+		w.filePath, currentOffset)
+
+	// 【修复4】立即将偏移量重置为 0，让新文件从头开始
+	// 这样可以避免新文件打开时读到旧的偏移量
+	w.offsetManager.SetOffset(w.filePath, 0)
+
 	return true
 }
 
