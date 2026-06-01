@@ -1,12 +1,12 @@
 package main
 
 import (
-	"bufio"
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,579 +15,330 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/joho/godotenv"
 )
 
-// 日志类型常量
-const (
-	LogTypeL7Flow      = "l7_flow_log"
-	LogTypeL4Flow      = "l4_flow_log"
-	LogTypeFlowMetrics = "flow_metrics"
-)
-
-// 配置
 type Config struct {
-	LogDir            string
-	NewRelicAppName   string
 	NewRelicLicense   string
 	NewRelicAccountID string
 	BatchSize         int
 	FlushInterval     time.Duration
-	MetricsEnabled    bool
 	LogLevel          string
-	EventTypeL7       string
-	EventTypeL4       string
-	EventTypeMetrics  string
-	Hostname          string
+	HTTPPort          string
+	DebugDir          string
+	SaveDebugData     bool
 }
 
-// 日志处理器
-type LogProcessor struct {
-	config      Config
-	logWatchers map[string]*LogWatcher
-	nrClient    *NewRelicClient
-	mu          sync.RWMutex
-	stopCh      chan struct{}
-	wg          sync.WaitGroup
-	hostname    string
-}
-
-// 文件监听器
-type LogWatcher struct {
-	filePath  string
-	file      *os.File
-	processor *LogProcessor
-	logType   string
-}
-
-// 批量发送器
 type BatchSender struct {
 	logs      []json.RawMessage
 	mu        sync.Mutex
 	ticker    *time.Ticker
-	processor *LogProcessor
-	logType   string
+	nrClient  *NewRelicClient
+	eventType string
+	stopCh    chan struct{}
+	wg        sync.WaitGroup
+	debugFile *os.File
+	debugMu   sync.Mutex
+	config    *Config
+	totalSent int64
+}
+
+type Processor struct {
+	config        Config
+	nrClient      *NewRelicClient
+	l7Sender      *BatchSender
+	l4Sender      *BatchSender
+	metricsSender *BatchSender
+	stopCh        chan struct{}
+	wg            sync.WaitGroup
+	httpServer    *http.Server
 }
 
 func main() {
-	// 加载 .env 文件
-	if err := godotenv.Load(); err != nil {
-		log.Printf("Warning: No .env file found, using environment variables")
-	}
+	godotenv.Load()
 
-	// 获取主机名
-	hostname, err := os.Hostname()
-	if err != nil {
-		log.Printf("Warning: Failed to get hostname: %v, using 'unknown'", err)
-		hostname = "unknown"
-	}
-	log.Printf("Hostname: %s", hostname)
-
-	// 从环境变量读取配置
 	config := Config{
-		LogDir:            getEnv("DEEPFLOW_LOG_DIR", "/var/log/deepflow-agent"),
-		NewRelicAppName:   getEnv("NEW_RELIC_APP_NAME", "deepflow-agent"),
 		NewRelicLicense:   getEnv("NEW_RELIC_LICENSE_KEY", ""),
 		NewRelicAccountID: getEnv("NEW_RELIC_ACCOUNT_ID", ""),
-		BatchSize:         getEnvInt("BATCH_SIZE", 100),
-		FlushInterval:     getEnvDuration("FLUSH_INTERVAL", 5*time.Second),
-		MetricsEnabled:    getEnvBool("METRICS_ENABLED", true),
+		BatchSize:         getEnvInt("BATCH_SIZE", 10),
+		FlushInterval:     getEnvDuration("FLUSH_INTERVAL", 2*time.Second),
 		LogLevel:          getEnv("LOG_LEVEL", "info"),
-		EventTypeL7:       getEnv("EVENT_TYPE_L7", "DeepFlowL7Log"),
-		EventTypeL4:       getEnv("EVENT_TYPE_L4", "DeepFlowL4Log"),
-		EventTypeMetrics:  getEnv("EVENT_TYPE_METRICS", "DeepFlowFlowMetrics"),
-		Hostname:          hostname,
+		HTTPPort:          getEnv("HTTP_PORT", "8080"),
+		DebugDir:          getEnv("DEBUG_DIR", "./debug"),
+		SaveDebugData:     getEnvBool("SAVE_DEBUG_DATA", true),
 	}
 
-	// 验证必需配置
 	if config.NewRelicLicense == "" {
-		log.Fatal("NEW_RELIC_LICENSE_KEY is required (set in .env or environment variable)")
+		log.Fatal("NEW_RELIC_LICENSE_KEY is required")
 	}
 
-	log.Printf("Configuration loaded:")
-	log.Printf("  Hostname: %s", config.Hostname)
-	log.Printf("  New Relic License: %s...", config.NewRelicLicense[:8])
-	log.Printf("  New Relic Account ID: %s", config.NewRelicAccountID)
-	log.Printf("  Log Directory: %s", config.LogDir)
-	log.Printf("  Batch Size: %d", config.BatchSize)
-	log.Printf("  Flush Interval: %v", config.FlushInterval)
-
-	// 确保日志目录存在
-	if err := os.MkdirAll(config.LogDir, 0755); err != nil {
-		log.Fatalf("Failed to create log directory: %v", err)
+	if config.SaveDebugData {
+		os.MkdirAll(config.DebugDir, 0755)
 	}
 
-	// 创建 New Relic 客户端
 	nrClient := NewNewRelicClient(config.NewRelicLicense, config.NewRelicAccountID, false)
 
-	// 创建日志处理器
-	processor := &LogProcessor{
-		config:      config,
-		logWatchers: make(map[string]*LogWatcher),
-		nrClient:    nrClient,
-		stopCh:      make(chan struct{}),
-		hostname:    hostname,
+	processor := &Processor{
+		config:   config,
+		nrClient: nrClient,
+		stopCh:   make(chan struct{}),
 	}
 
-	// 初始化批量发送器
-	batchSenders := map[string]*BatchSender{
-		LogTypeL7Flow:      NewBatchSender(processor, LogTypeL7Flow),
-		LogTypeL4Flow:      NewBatchSender(processor, LogTypeL4Flow),
-		LogTypeFlowMetrics: NewBatchSender(processor, LogTypeFlowMetrics),
-	}
+	processor.l7Sender = NewBatchSender(nrClient, "DeepFlowL7Log", &config)
+	processor.l4Sender = NewBatchSender(nrClient, "DeepFlowL4Log", &config)
+	processor.metricsSender = NewBatchSender(nrClient, "DeepFlowMetrics", &config)
 
-	// 启动文件监听
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		log.Fatalf("Failed to create watcher: %v", err)
-	}
-	defer watcher.Close()
+	processor.l7Sender.Start()
+	processor.l4Sender.Start()
+	processor.metricsSender.Start()
 
-	if err := watcher.Add(config.LogDir); err != nil {
-		log.Fatalf("Failed to watch directory: %v", err)
-	}
+	processor.startHTTPServer()
 
-	// 处理现有文件
-	processor.wg.Add(1)
+	// Print stats every 10 seconds (only httpbin.org counts)
 	go func() {
-		defer processor.wg.Done()
-		processor.processExistingFiles(batchSenders)
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			// log.Printf("📊 Total sent - L7: %d, L4: %d, Metrics: %d",
+			// processor.l7Sender.totalSent, processor.l4Sender.totalSent, processor.metricsSender.totalSent)
+		}
 	}()
 
-	// 监听新文件和文件变化
-	processor.wg.Add(1)
-	go func() {
-		defer processor.wg.Done()
-		processor.watchEvents(watcher, batchSenders)
-	}()
-
-	// 启动批量发送
-	for _, sender := range batchSenders {
-		sender.Start()
-	}
-
-	// 启动 .pre 文件清理协程（每分钟扫描并删除）
-	processor.wg.Add(1)
-	go processor.cleanupPreFiles()
-
-	// 监听退出信号（支持 Ctrl+C）
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	log.Println("========================================")
-	log.Println("DeepFlow New Relic Sidecar started")
-	log.Printf("Watching directory: %s", config.LogDir)
-	log.Println("Press Ctrl+C to stop")
-	log.Println("========================================")
-
-	// 等待停止信号
 	<-sigCh
-	log.Println("\nReceived shutdown signal, stopping...")
+
+	log.Println("Shutting down...")
 	processor.Stop()
-	log.Println("Sidecar stopped successfully")
 }
 
-// shouldSkipFile 检查是否应该跳过文件
-func shouldSkipFile(fileName string) bool {
-	// 跳过 .pre 文件（不监控，让清理线程删除）
-	if strings.HasSuffix(fileName, ".pre") {
-		return true
-	}
-	return false
-}
+func (p *Processor) startHTTPServer() {
+	mux := http.NewServeMux()
 
-// cleanupPreFiles 定期清理 .pre 文件（每分钟扫描，发现即删除）
-func (p *LogProcessor) cleanupPreFiles() {
-	defer p.wg.Done()
-
-	// 每 1 分钟检查一次
-	ticker := time.NewTicker(1 * time.Minute)
-	defer ticker.Stop()
-
-	// 启动时立即执行一次清理
-	p.doCleanupPreFiles()
-
-	for {
-		select {
-		case <-p.stopCh:
+	mux.HandleFunc("/api/deepflow-data", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
-		case <-ticker.C:
-			p.doCleanupPreFiles()
 		}
-	}
-}
+		p.handleData(w, r)
+	})
 
-// doCleanupPreFiles 执行实际的清理操作（发现 .pre 文件立即删除）
-func (p *LogProcessor) doCleanupPreFiles() {
-	// 查找所有 .pre 文件
-	pattern := filepath.Join(p.config.LogDir, "*.pre")
-	files, err := filepath.Glob(pattern)
-	if err != nil {
-		log.Printf("Error finding .pre files: %v", err)
-		return
-	}
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"healthy"}`))
+	})
 
-	if len(files) == 0 {
-		return
-	}
+	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(fmt.Sprintf(`{
+			"l7_sent": %d,
+			"l4_sent": %d,
+			"metrics_sent": %d
+		}`,
+			p.l7Sender.totalSent, p.l4Sender.totalSent, p.metricsSender.totalSent)))
+	})
 
-	deletedCount := 0
-	for _, filePath := range files {
-		if err := os.Remove(filePath); err != nil {
-			if !os.IsNotExist(err) {
-				log.Printf("Failed to delete .pre file %s: %v", filePath, err)
-			}
-		} else {
-			log.Printf("Deleted .pre file: %s", filePath)
-			deletedCount++
-		}
-	}
-
-	if deletedCount > 0 {
-		log.Printf("Cleaned up %d .pre files", deletedCount)
-	}
-}
-
-func (p *LogProcessor) processExistingFiles(batchSenders map[string]*BatchSender) {
-	entries, err := os.ReadDir(p.config.LogDir)
-	if err != nil {
-		log.Printf("Error reading directory: %v", err)
-		return
-	}
-
-	log.Printf("Scanning directory %s for existing files...", p.config.LogDir)
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		fileName := entry.Name()
-		if shouldSkipFile(fileName) {
-			continue
-		}
-
-		// 只处理 .log 文件
-		if fileName == "l7_flow_log" || fileName == "l4_flow_log" || fileName == "flow_metrics" {
-			filePath := filepath.Join(p.config.LogDir, fileName)
-			log.Printf("Found existing file: %s", filePath)
-			p.watchFile(filePath, batchSenders)
-		}
-	}
-}
-
-func (p *LogProcessor) watchEvents(watcher *fsnotify.Watcher, batchSenders map[string]*BatchSender) {
-	for {
-		select {
-		case <-p.stopCh:
-			return
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return
-			}
-			if event.Op&fsnotify.Create == fsnotify.Create {
-				time.Sleep(100 * time.Millisecond)
-
-				fileName := filepath.Base(event.Name)
-				if shouldSkipFile(fileName) {
-					continue
-				}
-
-				if fileName == "l7_flow_log" || fileName == "l4_flow_log" || fileName == "flow_metrics" {
-					log.Printf("Detected new file: %s", event.Name)
-					p.watchFile(event.Name, batchSenders)
-				}
-			}
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return
-			}
-			log.Printf("Watcher error: %v", err)
-		}
-	}
-}
-
-func (p *LogProcessor) watchFile(filePath string, batchSenders map[string]*BatchSender) {
-	// 跳过 .pre 文件
-	if strings.HasSuffix(filePath, ".pre") {
-		log.Printf("Skipping .pre file: %s", filePath)
-		return
-	}
-
-	p.mu.Lock()
-	if _, exists := p.logWatchers[filePath]; exists {
-		p.mu.Unlock()
-		return
-	}
-	p.mu.Unlock()
-
-	var logType string
-	switch filepath.Base(filePath) {
-	case "l7_flow_log":
-		logType = LogTypeL7Flow
-	case "l4_flow_log":
-		logType = LogTypeL4Flow
-	case "flow_metrics":
-		logType = LogTypeFlowMetrics
-	default:
-		log.Printf("Unknown log type for file: %s", filePath)
-		return
-	}
-
-	log.Printf("Watching file: %s (type: %s)", filePath, logType)
-
-	watcher := &LogWatcher{
-		filePath:  filePath,
-		processor: p,
-		logType:   logType,
-	}
-
-	p.mu.Lock()
-	p.logWatchers[filePath] = watcher
-	p.mu.Unlock()
+	p.httpServer = &http.Server{Addr: ":" + p.config.HTTPPort, Handler: mux}
 
 	p.wg.Add(1)
-	go watcher.tailFile(batchSenders[logType])
+	go func() {
+		defer p.wg.Done()
+		if err := p.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTP error: %v", err)
+		}
+	}()
 }
 
-func (p *LogProcessor) Stop() {
-	close(p.stopCh)
-	p.wg.Wait()
-	log.Println("All goroutines stopped")
-}
+func (p *Processor) handleData(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
 
-// tailFile - 首次启动从开头读取，然后切换到 tail 模式
-func (w *LogWatcher) tailFile(sender *BatchSender) {
-	defer w.processor.wg.Done()
+	lines := strings.Split(string(body), "\n")
 
-	// 标记是否是第一次运行
-	isFirstRun := true
+	hostname, _ := os.Hostname()
+	l7Count := 0
+	l4Count := 0
+	metricsCount := 0
+	httpbinL7Count := 0
 
-	for {
-		select {
-		case <-w.processor.stopCh:
-			if w.file != nil {
-				w.file.Close()
-			}
-			return
-		default:
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
 		}
 
-		if w.file == nil {
-			file, err := os.Open(w.filePath)
-			if err != nil {
-				if !os.IsNotExist(err) {
-					log.Printf("Error opening file %s: %v", w.filePath, err)
-				}
-				time.Sleep(1 * time.Second)
+		parts := strings.SplitN(line, "|", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		dataType := parts[0]
+		dataStr := parts[1]
+
+		switch dataType {
+		case "l7":
+			var item map[string]interface{}
+			if err := json.Unmarshal([]byte(dataStr), &item); err != nil {
 				continue
 			}
 
-			if isFirstRun {
-				// 第一次启动：从文件开头读取所有现有内容
-				if _, err := file.Seek(0, io.SeekStart); err != nil {
-					log.Printf("Error seeking to start: %v", err)
-					file.Close()
-					time.Sleep(1 * time.Second)
-					continue
-				}
-				log.Printf("First run: reading %s from beginning", w.filePath)
-				isFirstRun = false
-			} else {
-				// 后续：从文件末尾开始 tail
-				if _, err := file.Seek(0, io.SeekEnd); err != nil {
-					log.Printf("Error seeking to end: %v", err)
-					file.Close()
-					time.Sleep(1 * time.Second)
-					continue
-				}
-				log.Printf("Tailing file: %s", w.filePath)
-			}
-
-			w.file = file
-		}
-
-		// 读取新行
-		reader := bufio.NewReader(w.file)
-		for {
-			line, err := reader.ReadBytes('\n')
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				log.Printf("Error reading file %s: %v", w.filePath, err)
-				w.file.Close()
-				w.file = nil
-				break
-			}
-			w.processLine(line, sender)
-		}
-
-		time.Sleep(100 * time.Millisecond)
-	}
-}
-
-func (w *LogWatcher) processLine(line []byte, sender *BatchSender) {
-	line = bytes.TrimSpace(line)
-	if len(line) == 0 {
-		return
-	}
-
-	// 解析原始 JSON
-	var rawData map[string]interface{}
-	if err := json.Unmarshal(line, &rawData); err != nil {
-		log.Printf("Failed to parse JSON: %v", err)
-		return
-	}
-
-	// 确定事件类型
-	var eventTypeName string
-	switch w.logType {
-	case LogTypeL7Flow:
-		eventTypeName = w.processor.config.EventTypeL7
-	case LogTypeL4Flow:
-		eventTypeName = w.processor.config.EventTypeL4
-	case LogTypeFlowMetrics:
-		eventTypeName = w.processor.config.EventTypeMetrics
-	default:
-		eventTypeName = getEnv("EVENT_TYPE_DEFAULT", "DeepFlowLog")
-	}
-
-	// 构建 New Relic 事件
-	nrEvent := map[string]interface{}{
-		"timestamp": time.Now().Unix(),
-		"eventType": eventTypeName,
-		"log_type":  w.logType,
-		"hostname":  w.processor.hostname,
-	}
-
-	// 展开 rawData 中的所有字段
-	for key, value := range rawData {
-		if key == "eventType" || key == "timestamp" {
-			continue
-		}
-
-		// 处理嵌套的 meter 结构
-		if key == "meter" {
-			if meter, ok := value.(map[string]interface{}); ok {
-				// 处理 Flow 指标
-				if flow, ok := meter["Flow"].(map[string]interface{}); ok {
-					if traffic, ok := flow["traffic"].(map[string]interface{}); ok {
-						for k, v := range traffic {
-							nrEvent["traffic_"+k] = v
-						}
-					}
-					if latency, ok := flow["latency"].(map[string]interface{}); ok {
-						for k, v := range latency {
-							nrEvent["latency_"+k] = v
-						}
-					}
-					if perf, ok := flow["performance"].(map[string]interface{}); ok {
-						for k, v := range perf {
-							nrEvent["performance_"+k] = v
-						}
-					}
-					if anomaly, ok := flow["anomaly"].(map[string]interface{}); ok {
-						for k, v := range anomaly {
-							nrEvent["anomaly_"+k] = v
-						}
-					}
-					if flowLoad, ok := flow["flow_load"].(map[string]interface{}); ok {
-						for k, v := range flowLoad {
-							nrEvent["flow_load_"+k] = v
-						}
-					}
-				}
-				// 处理 App 指标
-				if app, ok := meter["App"].(map[string]interface{}); ok {
-					if traffic, ok := app["traffic"].(map[string]interface{}); ok {
-						for k, v := range traffic {
-							nrEvent["app_traffic_"+k] = v
-						}
-					}
-					if latency, ok := app["latency"].(map[string]interface{}); ok {
-						for k, v := range latency {
-							nrEvent["app_latency_"+k] = v
-						}
-					}
-					if anomaly, ok := app["anomaly"].(map[string]interface{}); ok {
-						for k, v := range anomaly {
-							nrEvent["app_anomaly_"+k] = v
-						}
-					}
-				}
-			}
-			continue
-		}
-
-		// 处理 tagger 嵌套结构
-		if key == "tagger" {
-			if tagger, ok := value.(map[string]interface{}); ok {
-				for k, v := range tagger {
-					if k == "code" {
-						continue
-					}
-					if (k == "mac" || k == "mac1") && len(v.([]interface{})) >= 3 {
-						macArr := v.([]interface{})
-						nrEvent[k] = fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
-							toByte(macArr[0]), toByte(macArr[1]), toByte(macArr[2]),
-							toByte(macArr[3]), toByte(macArr[4]), toByte(macArr[5]))
-						continue
-					}
-					nrEvent["tagger_"+k] = v
-				}
-			}
-			continue
-		}
-
-		// 处理 trace_ids 数组
-		if key == "trace_ids" {
-			if traceIDs, ok := value.([]interface{}); ok && len(traceIDs) > 0 {
-				if traceID, ok := traceIDs[0].(string); ok {
-					nrEvent["trace_id"] = traceID
-				}
-				nrEvent["trace_ids"] = value
-			}
-			continue
-		}
-
-		// 处理 attributes 嵌套对象
-		if key == "attributes" {
-			if attrs, ok := value.(map[string]interface{}); ok {
-				if apmTraceID, ok := attrs["apm_trace_id"].(string); ok {
-					nrEvent["apm_trace_id"] = apmTraceID
-				}
-				if traceparent, ok := attrs["traceparent"].(string); ok {
-					nrEvent["traceparent"] = traceparent
-				}
+			// FLATTEN attributes object
+			if attrs, ok := item["attributes"].(map[string]interface{}); ok {
 				for k, v := range attrs {
-					switch k {
-					case "apm_trace_id", "traceparent":
-						continue
-					default:
-						nrEvent["attr_"+k] = v
-					}
+					item["attr_"+k] = v
+				}
+				delete(item, "attributes")
+			}
+
+			// FLATTEN trace_ids array
+			if traceIds, ok := item["trace_ids"].([]interface{}); ok && len(traceIds) > 0 {
+				if traceIdStr, ok := traceIds[0].(string); ok {
+					item["trace_id"] = traceIdStr
+				}
+				delete(item, "trace_ids")
+			}
+
+			// Check if this is httpbin.org request
+			isHttpBin := false
+			if requestDomain, ok := item["request_domain"]; ok {
+				if domainStr, ok := requestDomain.(string); ok && domainStr == "httpbin.org" {
+					isHttpBin = true
+					httpbinL7Count++
 				}
 			}
-			continue
+
+			item["eventType"] = "DeepFlowL7Log"
+			item["hostname"] = hostname
+			item["ingest_timestamp"] = time.Now().UnixMilli()
+
+			jsonBytes, err := json.Marshal(item)
+			if err != nil {
+				continue
+			}
+
+			if p.config.SaveDebugData {
+				p.l7Sender.saveToDebugFile(jsonBytes)
+			}
+			p.l7Sender.Add(json.RawMessage(jsonBytes))
+			l7Count++
+
+			if isHttpBin && p.config.LogLevel == "info" {
+				// Print flattened httpbin event
+				itemJSON, _ := json.MarshalIndent(item, "", "  ")
+				log.Printf("🔍 httpbin.org event (flattened):\n%s", string(itemJSON))
+			}
+
+		case "l4":
+			var item map[string]interface{}
+			if err := json.Unmarshal([]byte(dataStr), &item); err != nil {
+				continue
+			}
+
+			item["eventType"] = "DeepFlowL4Log"
+			item["hostname"] = hostname
+			item["ingest_timestamp"] = time.Now().UnixMilli()
+
+			jsonBytes, err := json.Marshal(item)
+			if err != nil {
+				continue
+			}
+
+			if p.config.SaveDebugData {
+				p.l4Sender.saveToDebugFile(jsonBytes)
+			}
+			p.l4Sender.Add(json.RawMessage(jsonBytes))
+			l4Count++
+
+		case "metrics":
+			var item map[string]interface{}
+			if err := json.Unmarshal([]byte(dataStr), &item); err != nil {
+				continue
+			}
+
+			flattened := flattenMetrics(item)
+			flattened["eventType"] = "DeepFlowMetrics"
+			flattened["hostname"] = hostname
+			flattened["ingest_timestamp"] = time.Now().UnixMilli()
+
+			jsonBytes, err := json.Marshal(flattened)
+			if err != nil {
+				continue
+			}
+
+			if p.config.SaveDebugData {
+				p.metricsSender.saveToDebugFile(jsonBytes)
+			}
+			p.metricsSender.Add(json.RawMessage(jsonBytes))
+			metricsCount++
 		}
-
-		// 普通字段直接添加
-		nrEvent[key] = value
 	}
 
-	// 序列化事件
-	eventJSON, err := json.Marshal(nrEvent)
-	if err != nil {
-		log.Printf("Failed to marshal event: %v", err)
-		return
+	if httpbinL7Count > 0 {
+		log.Printf("✅ Processed %d httpbin.org L7 events (total L7: %d)", httpbinL7Count, l7Count)
 	}
 
-	sender.Add(eventJSON)
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(fmt.Sprintf(`{"status":"ok","l7":%d,"l4":%d,"metrics":%d}`,
+		l7Count, l4Count, metricsCount)))
 }
 
-// 辅助函数：将 interface{} 转换为 byte
+func flattenMetrics(data map[string]interface{}) map[string]interface{} {
+	flattened := make(map[string]interface{})
+
+	if ts, ok := data["timestamp"]; ok {
+		flattened["timestamp"] = ts
+	}
+
+	if tagger, ok := data["tagger"].(map[string]interface{}); ok {
+		for k, v := range tagger {
+			if k == "code" {
+				continue
+			}
+			if k == "mac" || k == "mac1" {
+				if macArr, ok := v.([]interface{}); ok && len(macArr) >= 3 {
+					flattened["tagger_"+k] = fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
+						toByte(macArr[0]), toByte(macArr[1]), toByte(macArr[2]),
+						toByte(macArr[3]), toByte(macArr[4]), toByte(macArr[5]))
+					continue
+				}
+			}
+			flattened["tagger_"+k] = v
+		}
+	}
+
+	if meter, ok := data["meter"].(map[string]interface{}); ok {
+		if app, ok := meter["App"].(map[string]interface{}); ok {
+			if traffic, ok := app["traffic"].(map[string]interface{}); ok {
+				for k, v := range traffic {
+					flattened["app_traffic_"+k] = v
+				}
+			}
+			if latency, ok := app["latency"].(map[string]interface{}); ok {
+				for k, v := range latency {
+					flattened["app_latency_"+k] = v
+				}
+			}
+			if anomaly, ok := app["anomaly"].(map[string]interface{}); ok {
+				for k, v := range anomaly {
+					flattened["app_anomaly_"+k] = v
+				}
+			}
+		}
+	}
+
+	if flags, ok := data["flags"].(map[string]interface{}); ok {
+		if bits, ok := flags["bits"]; ok {
+			flattened["flags_bits"] = bits
+		}
+	}
+
+	return flattened
+}
+
 func toByte(v interface{}) byte {
 	switch val := v.(type) {
 	case float64:
@@ -599,24 +350,82 @@ func toByte(v interface{}) byte {
 	}
 }
 
-func NewBatchSender(processor *LogProcessor, logType string) *BatchSender {
-	return &BatchSender{
-		logs:      make([]json.RawMessage, 0, processor.config.BatchSize),
-		ticker:    time.NewTicker(processor.config.FlushInterval),
-		processor: processor,
-		logType:   logType,
+func (p *Processor) Stop() {
+	close(p.stopCh)
+
+	if p.l7Sender != nil {
+		p.l7Sender.Stop()
 	}
+	if p.l4Sender != nil {
+		p.l4Sender.Stop()
+	}
+	if p.metricsSender != nil {
+		p.metricsSender.Stop()
+	}
+
+	if p.httpServer != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		p.httpServer.Shutdown(ctx)
+	}
+
+	p.wg.Wait()
+	log.Println("Sidecar stopped")
+}
+
+func NewBatchSender(nrClient *NewRelicClient, eventType string, config *Config) *BatchSender {
+	sender := &BatchSender{
+		logs:      make([]json.RawMessage, 0, config.BatchSize),
+		ticker:    time.NewTicker(config.FlushInterval),
+		nrClient:  nrClient,
+		eventType: eventType,
+		stopCh:    make(chan struct{}),
+		config:    config,
+		totalSent: 0,
+	}
+
+	if config.SaveDebugData {
+		var filename string
+		switch eventType {
+		case "DeepFlowL7Log":
+			filename = "l7_debug.jsonl"
+		case "DeepFlowL4Log":
+			filename = "l4_debug.jsonl"
+		case "DeepFlowMetrics":
+			filename = "metrics_debug.jsonl"
+		}
+		filepath := filepath.Join(config.DebugDir, filename)
+		file, err := os.OpenFile(filepath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err == nil {
+			sender.debugFile = file
+		}
+	}
+
+	return sender
+}
+
+func (b *BatchSender) saveToDebugFile(data []byte) {
+	if b.debugFile == nil {
+		return
+	}
+	b.debugMu.Lock()
+	defer b.debugMu.Unlock()
+	b.debugFile.Write(data)
+	b.debugFile.Write([]byte("\n"))
 }
 
 func (b *BatchSender) Start() {
-	b.processor.wg.Add(1)
+	b.wg.Add(1)
 	go func() {
-		defer b.processor.wg.Done()
+		defer b.wg.Done()
 		for {
 			select {
-			case <-b.processor.stopCh:
+			case <-b.stopCh:
 				b.flush()
 				b.ticker.Stop()
+				if b.debugFile != nil {
+					b.debugFile.Close()
+				}
 				return
 			case <-b.ticker.C:
 				b.flush()
@@ -625,11 +434,16 @@ func (b *BatchSender) Start() {
 	}()
 }
 
+func (b *BatchSender) Stop() {
+	close(b.stopCh)
+	b.wg.Wait()
+}
+
 func (b *BatchSender) Add(log json.RawMessage) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.logs = append(b.logs, log)
-	if len(b.logs) >= b.processor.config.BatchSize {
+	if len(b.logs) >= b.config.BatchSize {
 		b.flushLocked()
 	}
 }
@@ -645,17 +459,47 @@ func (b *BatchSender) flushLocked() {
 		return
 	}
 
-	log.Printf("Sending %d events to New Relic for %s", len(b.logs), b.logType)
+	// Only log if this is L7 and might contain httpbin.org
+	if b.eventType == "DeepFlowL7Log" && b.config.LogLevel == "info" {
+		// Check if any event in batch is httpbin.org
+		hasHttpBin := false
+		for _, log := range b.logs {
+			var item map[string]interface{}
+			if err := json.Unmarshal(log, &item); err == nil {
+				if requestDomain, ok := item["request_domain"]; ok {
+					if domainStr, ok := requestDomain.(string); ok && domainStr == "httpbin.org" {
+						hasHttpBin = true
+						break
+					}
+				}
+			}
+		}
+		if hasHttpBin {
+			log.Printf("📤 Sending batch with %d L7 events (including httpbin.org)", len(b.logs))
+		}
+	}
 
-	if err := b.processor.nrClient.SendLogs(b.logs); err != nil {
-		log.Printf("Failed to send logs to New Relic: %v", err)
-		return
+	err := b.nrClient.SendLogs(b.logs)
+	if err != nil {
+		log.Printf("❌ Failed to send %s events: %v", b.eventType, err)
+	} else {
+		b.totalSent += int64(len(b.logs))
+		// Only log for L7 events that might be httpbin.org
+		if b.eventType == "DeepFlowL7Log" {
+			// log.Printf("✅ Sent %d L7 events (total L7 sent: %d)", len(b.logs), b.totalSent)
+		}
 	}
 
 	b.logs = b.logs[:0]
 }
 
-// 辅助函数
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
