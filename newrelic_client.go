@@ -46,65 +46,90 @@ func NewNewRelicClient(licenseKey, accountID string, debugMode bool) *NewRelicCl
 	return client
 }
 
-func (c *NewRelicClient) SendLogs(logs []json.RawMessage) error {
-	if len(logs) == 0 {
-		return nil
-	}
-
-	// 解析所有事件
-	var events []map[string]interface{}
-	for _, logEntry := range logs {
-		var event map[string]interface{}
-		if err := json.Unmarshal(logEntry, &event); err != nil {
-			log.Printf("Failed to unmarshal event: %v", err)
-			continue
-		}
-		events = append(events, event)
-	}
-
+func (c *NewRelicClient) SendLogs(events []json.RawMessage) error {
 	if len(events) == 0 {
 		return nil
 	}
 
-	// Insights API 期望的格式：{"eventType": "...", ...}
-	var payload bytes.Buffer
+	url := fmt.Sprintf("https://insights-collector.newrelic.com/v1/accounts/%s/events", c.accountID)
+
+	var payload []map[string]interface{}
 	for _, event := range events {
-		eventBytes, err := json.Marshal(event)
-		if err != nil {
+		var eventMap map[string]interface{}
+		if err := json.Unmarshal(event, &eventMap); err != nil {
 			continue
 		}
-		payload.Write(eventBytes)
-		payload.WriteByte('\n')
+		payload = append(payload, eventMap)
 	}
 
-	if c.debugMode {
-		log.Printf("Sending %d events (%d bytes) to New Relic", len(events), payload.Len())
+	// Check if this batch contains any httpbin.org events
+	hasHttpBin := false
+	httpBinEvents := []map[string]interface{}{}
+	for _, event := range payload {
+		if requestDomain, ok := event["request_domain"]; ok {
+			if domainStr, ok := requestDomain.(string); ok && domainStr == "httpbin.org" {
+				hasHttpBin = true
+				httpBinEvents = append(httpBinEvents, event)
+			}
+		}
 	}
 
-	req, err := http.NewRequest("POST", c.endpoint, &payload)
+	// Only log if this batch has httpbin.org events
+	if hasHttpBin {
+		log.Printf("📤 Sending batch with %d L7 events (including %d httpbin.org events)", len(payload), len(httpBinEvents))
+
+		// Print each httpbin.org event
+		for i, event := range httpBinEvents {
+			eventJSON, _ := json.MarshalIndent(event, "", "  ")
+			log.Printf("🔍 httpbin.org event #%d:\n%s", i+1, string(eventJSON))
+		}
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Insert-Key", c.licenseKey)
+	req.Header.Set("Api-Key", c.licenseKey)
 
-	resp, err := c.client.Do(req)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("HTTP request failed: %v", err)
+		if hasHttpBin {
+			log.Printf("❌ HTTP request failed for httpbin.org batch: %v", err)
+		}
 		return err
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	respBody, _ := io.ReadAll(resp.Body)
 
-	if resp.StatusCode != 200 && resp.StatusCode != 202 {
-		log.Printf("New Relic API error: status=%d, body=%s", resp.StatusCode, string(body))
-		return fmt.Errorf("API error: %d - %s", resp.StatusCode, string(body))
+	if hasHttpBin {
+		log.Printf("📬 New Relic response for httpbin.org batch: status=%d, body=%s", resp.StatusCode, string(respBody))
 	}
 
-	if c.debugMode {
-		log.Printf("Successfully sent %d events, response: %s", len(events), string(body))
+	if resp.StatusCode != http.StatusOK {
+		if hasHttpBin {
+			log.Printf("❌ New Relic rejected httpbin.org events: %d - %s", resp.StatusCode, string(respBody))
+		}
+		return fmt.Errorf("New Relic returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var nrResponse struct {
+		Success bool `json:"success"`
+	}
+	if err := json.Unmarshal(respBody, &nrResponse); err == nil {
+		if nrResponse.Success && hasHttpBin {
+			log.Printf("✅ New Relic accepted %d events (including %d httpbin.org events)", len(payload), len(httpBinEvents))
+		} else if !nrResponse.Success && hasHttpBin {
+			log.Printf("⚠️ New Relic rejected httpbin.org events: %s", string(respBody))
+		}
 	}
 
 	return nil

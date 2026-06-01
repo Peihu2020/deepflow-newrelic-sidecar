@@ -1,9 +1,13 @@
-controller-ips:
-  - 127.0.0.1
-controller-port: 30035
 log-file: /var/log/deepflow-agent/deepflow-agent.log
 log-level: info
+global:
+  limits:
+    max_memory: 1024      # 1536 MiB = 1.5 GB ✅
+    max_millicpus: 1000   # 2000 millicpus = 2 cores ✅
 
+  standalone_mode:
+    max_data_file_size: 10      # 10 MiB ✅
+    data_file_dir: /var/log/deepflow-agent/   # ✅
 static_config:
   ebpf:
     enabled: true
@@ -17,9 +21,10 @@ static_config:
       on_cpu:
         disabled: true
         sampling_frequency: 99
-
-  tap_interface_regex: ^(eth.*|en.*|lo|veth.*)
 inputs:
+  cbpf:
+    af_packet:
+      interface_regex:  ^(eth.*|en.*|veth.*)$
   ebpf:
     socket:
       tunning:
@@ -77,3 +82,10 @@ processors:
         HTTP2:
           - field_name: "traceparent"
           - field_name: "x-request-id"
+
+outputs:
+  http_forward:
+    enabled: true
+    url: "http://127.0.0.1:8080/api/deepflow-data"
+    timeout_seconds: 5
+    batch_size: 1
