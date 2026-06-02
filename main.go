@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -19,14 +20,29 @@ import (
 )
 
 type Config struct {
+	// NewRelic config
 	NewRelicLicense   string
 	NewRelicAccountID string
-	BatchSize         int
-	FlushInterval     time.Duration
-	LogLevel          string
-	HTTPPort          string
-	DebugDir          string
-	SaveDebugData     bool
+	NewRelicDebugMode bool
+
+	// Sidecar config
+	BatchSize     int
+	FlushInterval time.Duration
+	LogLevel      string
+	HTTPPort      string
+	DebugDir      string
+	SaveDebugData bool
+
+	// DeepFlow source mode
+	DeepFlowSourceMode string // "http" or "file"
+
+	// File mode config
+	DeepFlowLogDir       string
+	DeepFlowPollInterval time.Duration
+	DeepFlowStartFromEnd bool
+
+	// HTTP mode config
+	DeepFlowHTTPEndpoint string
 }
 
 type BatchSender struct {
@@ -52,31 +68,68 @@ type Processor struct {
 	stopCh        chan struct{}
 	wg            sync.WaitGroup
 	httpServer    *http.Server
+	fileWatcher   *FileWatcher
+}
+
+type FileWatcher struct {
+	config          *Processor
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
+	fileOffsets     map[string]int64  // Last read offset for each file
+	fileInodes      map[string]uint64 // Inode number to detect rotation
+	fileLastSize    map[string]int64  // Last file size to detect truncation
+	processedInodes map[uint64]bool   // Track which inodes we've processed
+	mu              sync.Mutex
 }
 
 func main() {
 	godotenv.Load()
 
 	config := Config{
+		// NewRelic config
 		NewRelicLicense:   getEnv("NEW_RELIC_LICENSE_KEY", ""),
 		NewRelicAccountID: getEnv("NEW_RELIC_ACCOUNT_ID", ""),
-		BatchSize:         getEnvInt("BATCH_SIZE", 10),
-		FlushInterval:     getEnvDuration("FLUSH_INTERVAL", 2*time.Second),
-		LogLevel:          getEnv("LOG_LEVEL", "info"),
-		HTTPPort:          getEnv("HTTP_PORT", "8080"),
-		DebugDir:          getEnv("DEBUG_DIR", "./debug"),
-		SaveDebugData:     getEnvBool("SAVE_DEBUG_DATA", true),
+		NewRelicDebugMode: getEnvBool("NEW_RELIC_DEBUG_MODE", false),
+
+		// Sidecar config
+		BatchSize:     getEnvInt("BATCH_SIZE", 100),
+		FlushInterval: getEnvDuration("FLUSH_INTERVAL", 5*time.Second),
+		LogLevel:      getEnv("LOG_LEVEL", "info"),
+		HTTPPort:      getEnv("HTTP_PORT", "8080"),
+		DebugDir:      getEnv("DEBUG_DIR", "./debug"),
+		SaveDebugData: getEnvBool("SAVE_DEBUG_DATA", true),
+
+		// DeepFlow source mode
+		DeepFlowSourceMode: getEnv("DEEPFLOW_SOURCE_MODE", "http"),
+
+		// File mode config
+		DeepFlowLogDir:       getEnv("DEEPFLOW_LOG_DIR", "/var/log/deepflow-agent/"),
+		DeepFlowPollInterval: getEnvDuration("DEEPFLOW_POLL_INTERVAL", 5*time.Second),
+		DeepFlowStartFromEnd: getEnvBool("DEEPFLOW_START_FROM_END", true),
+
+		// HTTP mode config
+		DeepFlowHTTPEndpoint: getEnv("DEEPFLOW_HTTP_ENDPOINT", "/api/deepflow-data"),
 	}
 
 	if config.NewRelicLicense == "" {
 		log.Fatal("NEW_RELIC_LICENSE_KEY is required")
 	}
 
-	if config.SaveDebugData {
-		os.MkdirAll(config.DebugDir, 0755)
+	if config.NewRelicAccountID == "" {
+		log.Fatal("NEW_RELIC_ACCOUNT_ID is required")
 	}
 
-	nrClient := NewNewRelicClient(config.NewRelicLicense, config.NewRelicAccountID, false)
+	if config.SaveDebugData {
+		if err := os.MkdirAll(config.DebugDir, 0755); err != nil {
+			log.Printf("Warning: Failed to create debug directory: %v", err)
+		}
+	}
+
+	log.Printf("Starting sidecar in %s mode", config.DeepFlowSourceMode)
+	log.Printf("Log level: %s", config.LogLevel)
+	log.Printf("Start from end: %v", config.DeepFlowStartFromEnd)
+
+	nrClient := NewNewRelicClient(config.NewRelicLicense, config.NewRelicAccountID, config.NewRelicDebugMode)
 
 	processor := &Processor{
 		config:   config,
@@ -92,15 +145,26 @@ func main() {
 	processor.l4Sender.Start()
 	processor.metricsSender.Start()
 
-	processor.startHTTPServer()
+	// Start appropriate data source based on mode
+	if config.DeepFlowSourceMode == "http" {
+		processor.startHTTPServer()
+	} else if config.DeepFlowSourceMode == "file" {
+		processor.startFileWatcher()
+	} else {
+		log.Fatalf("Invalid DEEPFLOW_SOURCE_MODE: %s. Must be 'http' or 'file'", config.DeepFlowSourceMode)
+	}
 
-	// Print stats every 10 seconds (only httpbin.org counts)
+	// Print stats periodically
 	go func() {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
-			// log.Printf("📊 Total sent - L7: %d, L4: %d, Metrics: %d",
-			// processor.l7Sender.totalSent, processor.l4Sender.totalSent, processor.metricsSender.totalSent)
+			if config.LogLevel == "info" {
+				log.Printf("📊 Total Sent - L7: %d, L4: %d, Metrics: %d",
+					processor.l7Sender.totalSent,
+					processor.l4Sender.totalSent,
+					processor.metricsSender.totalSent)
+			}
 		}
 	}()
 
@@ -112,10 +176,25 @@ func main() {
 	processor.Stop()
 }
 
+func (p *Processor) startFileWatcher() {
+	p.fileWatcher = &FileWatcher{
+		config:          p,
+		stopCh:          make(chan struct{}),
+		fileOffsets:     make(map[string]int64),
+		fileInodes:      make(map[string]uint64),
+		fileLastSize:    make(map[string]int64),
+		processedInodes: make(map[uint64]bool),
+	}
+
+	p.fileWatcher.Start()
+	log.Printf("File watcher started. Monitoring directory: %s", p.config.DeepFlowLogDir)
+	log.Printf("Monitoring files: l7_flow_log, l4_flow_log, flow_metrics (NOT .pre files)")
+}
+
 func (p *Processor) startHTTPServer() {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/deepflow-data", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc(p.config.DeepFlowHTTPEndpoint, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
@@ -124,18 +203,69 @@ func (p *Processor) startHTTPServer() {
 	})
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"healthy"}`))
+		w.Write([]byte(fmt.Sprintf(`{"status":"healthy","mode":"%s"}`, p.config.DeepFlowSourceMode)))
 	})
 
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(fmt.Sprintf(`{
-			"l7_sent": %d,
-			"l4_sent": %d,
-			"metrics_sent": %d
-		}`,
-			p.l7Sender.totalSent, p.l4Sender.totalSent, p.metricsSender.totalSent)))
+
+		offsetInfo := make(map[string]interface{})
+		if p.fileWatcher != nil {
+			p.fileWatcher.mu.Lock()
+			for k, v := range p.fileWatcher.fileOffsets {
+				offsetInfo[k] = v
+			}
+			p.fileWatcher.mu.Unlock()
+		}
+
+		response := map[string]interface{}{
+			"mode":         p.config.DeepFlowSourceMode,
+			"l7_sent":      p.l7Sender.totalSent,
+			"l4_sent":      p.l4Sender.totalSent,
+			"metrics_sent": p.metricsSender.totalSent,
+			"offsets":      offsetInfo,
+		}
+
+		json.NewEncoder(w).Encode(response)
+	})
+
+	mux.HandleFunc("/api/flush", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		p.l7Sender.flush()
+		p.l4Sender.flush()
+		p.metricsSender.flush()
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"flushed"}`))
+	})
+
+	mux.HandleFunc("/api/reset", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if p.fileWatcher != nil {
+			p.fileWatcher.mu.Lock()
+			p.fileWatcher.fileOffsets = make(map[string]int64)
+			p.fileWatcher.fileInodes = make(map[string]uint64)
+			p.fileWatcher.fileLastSize = make(map[string]int64)
+			p.fileWatcher.processedInodes = make(map[uint64]bool)
+			p.fileWatcher.mu.Unlock()
+
+			log.Printf("🔄 File watcher state reset")
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"status":"reset","message":"File watcher reset, will re-read files on next poll"}`))
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"status":"error","message":"Not in file mode"}`))
+		}
 	})
 
 	p.httpServer = &http.Server{Addr: ":" + p.config.HTTPPort, Handler: mux}
@@ -143,12 +273,467 @@ func (p *Processor) startHTTPServer() {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
+		log.Printf("HTTP server listening on port %s", p.config.HTTPPort)
 		if err := p.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("HTTP error: %v", err)
 		}
 	}()
 }
 
+// FileWatcher Methods
+func (f *FileWatcher) Start() {
+	f.wg.Add(1)
+	go f.watchFiles()
+}
+
+func (f *FileWatcher) watchFiles() {
+	defer f.wg.Done()
+
+	// Initial scan to set up file positions
+	f.initializeFilePositions()
+
+	ticker := time.NewTicker(f.config.config.DeepFlowPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-f.stopCh:
+			return
+		case <-ticker.C:
+			f.scanAndProcessFiles()
+		}
+	}
+}
+
+func (f *FileWatcher) initializeFilePositions() {
+	filesToWatch := []string{
+		"l7_flow_log",
+		"l4_flow_log",
+		"flow_metrics",
+	}
+
+	for _, fileName := range filesToWatch {
+		filePath := filepath.Join(f.config.config.DeepFlowLogDir, fileName)
+		f.initializeFile(filePath, fileName)
+	}
+}
+
+func (f *FileWatcher) initializeFile(filePath, fileName string) {
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		if f.config.config.LogLevel == "debug" {
+			log.Printf("File %s does not exist yet, will wait for it", filePath)
+		}
+		return
+	}
+
+	// Get inode
+	stat, ok := fileInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		log.Printf("Cannot get inode for %s, skipping", filePath)
+		return
+	}
+	inode := stat.Ino
+
+	// Check if we've processed this inode before
+	f.mu.Lock()
+	alreadyProcessed := f.processedInodes[inode]
+	f.mu.Unlock()
+
+	var initialOffset int64
+	if alreadyProcessed {
+		// Already processed this file, start from end
+		initialOffset = fileInfo.Size()
+		if f.config.config.LogLevel == "info" {
+			log.Printf("Already processed %s (inode: %d), starting from end (offset: %d)",
+				fileName, inode, initialOffset)
+		}
+	} else {
+		// First time seeing this file
+		if f.config.config.DeepFlowStartFromEnd {
+			initialOffset = fileInfo.Size()
+			log.Printf("Starting to watch %s from end (offset: %d bytes, inode: %d, size: %d)",
+				fileName, initialOffset, inode, fileInfo.Size())
+		} else {
+			initialOffset = 0
+			log.Printf("Starting to watch %s from beginning (offset: %d bytes, inode: %d, size: %d)",
+				fileName, initialOffset, inode, fileInfo.Size())
+		}
+	}
+
+	f.mu.Lock()
+	f.fileOffsets[fileName] = initialOffset
+	f.fileInodes[fileName] = inode
+	f.fileLastSize[fileName] = fileInfo.Size()
+	f.processedInodes[inode] = true
+	f.mu.Unlock()
+
+	// Read if starting from beginning
+	if initialOffset == 0 && fileInfo.Size() > 0 {
+		log.Printf("📖 Reading existing %d bytes from %s", fileInfo.Size(), fileName)
+		f.readNewLines(filePath, fileName, 0)
+	}
+}
+
+func (f *FileWatcher) scanAndProcessFiles() {
+	filesToWatch := []string{
+		"l7_flow_log",
+		"l4_flow_log",
+		"flow_metrics",
+	}
+
+	for _, fileName := range filesToWatch {
+		filePath := filepath.Join(f.config.config.DeepFlowLogDir, fileName)
+		f.processFile(filePath, fileName)
+	}
+}
+
+func (f *FileWatcher) processFile(filePath, fileName string) {
+	// Check if file exists
+	fileInfo, err := os.Stat(filePath)
+	if err != nil {
+		// File doesn't exist, clean up state
+		f.mu.Lock()
+		delete(f.fileOffsets, fileName)
+		delete(f.fileInodes, fileName)
+		delete(f.fileLastSize, fileName)
+		f.mu.Unlock()
+		return
+	}
+
+	// Get current inode
+	stat, ok := fileInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		log.Printf("Cannot get inode for %s, skipping", filePath)
+		return
+	}
+	currentInode := stat.Ino
+
+	// Get current state
+	f.mu.Lock()
+	lastInode, inodeExists := f.fileInodes[fileName]
+	lastOffset, offsetExists := f.fileOffsets[fileName]
+	lastSize, sizeExists := f.fileLastSize[fileName]
+	// alreadyProcessed := f.processedInodes[currentInode]
+	f.mu.Unlock()
+
+	// Case 1: File was rotated (inode changed)
+	if inodeExists && currentInode != lastInode {
+		f.handleFileRotation(filePath, fileName, fileInfo, currentInode)
+		return
+	}
+
+	// Case 2: First time seeing this file
+	if !inodeExists {
+		f.initializeFile(filePath, fileName)
+		return
+	}
+
+	// Case 3: File was truncated (size decreased but inode same)
+	if sizeExists && fileInfo.Size() < lastSize {
+		f.handleFileTruncation(filePath, fileName, fileInfo)
+		return
+	}
+
+	// Case 4: No new data
+	if offsetExists && lastOffset >= fileInfo.Size() {
+		return
+	}
+
+	// Case 5: Read only new data from lastOffset to EOF
+	if offsetExists && lastOffset < fileInfo.Size() {
+		f.readNewLines(filePath, fileName, lastOffset)
+	}
+}
+
+func (f *FileWatcher) handleFileRotation(filePath, fileName string, fileInfo os.FileInfo, newInode uint64) {
+	f.mu.Lock()
+	oldInode := f.fileInodes[fileName]
+	alreadyProcessed := f.processedInodes[newInode]
+	f.mu.Unlock()
+
+	log.Printf("🔄 File %s was rotated (inode: %d -> %d)", fileName, oldInode, newInode)
+
+	var newOffset int64
+
+	// If we've already processed this inode, start from end
+	if alreadyProcessed {
+		newOffset = fileInfo.Size()
+		log.Printf("  Already processed inode %d, starting from end (offset: %d)", newInode, newOffset)
+	} else {
+		// First time seeing this inode - decide based on config
+		if f.config.config.DeepFlowStartFromEnd {
+			newOffset = fileInfo.Size()
+			log.Printf("  New file %s size: %d bytes, starting at offset: %d (skip existing)",
+				fileName, fileInfo.Size(), newOffset)
+		} else {
+			newOffset = 0
+			log.Printf("  New file %s size: %d bytes, starting at offset: %d (will read existing)",
+				fileName, fileInfo.Size(), newOffset)
+		}
+	}
+
+	// Update state for new file
+	f.mu.Lock()
+	f.fileOffsets[fileName] = newOffset
+	f.fileInodes[fileName] = newInode
+	f.fileLastSize[fileName] = fileInfo.Size()
+	f.processedInodes[newInode] = true
+	f.mu.Unlock()
+
+	// Read existing data if starting from beginning
+	if newOffset == 0 && fileInfo.Size() > 0 {
+		log.Printf("📖 Reading %d bytes from newly rotated %s", fileInfo.Size(), fileName)
+		f.readNewLines(filePath, fileName, 0)
+	}
+}
+
+func (f *FileWatcher) handleFileTruncation(filePath, fileName string, fileInfo os.FileInfo) {
+	f.mu.Lock()
+	oldSize := f.fileLastSize[fileName]
+	f.mu.Unlock()
+
+	log.Printf("⚠️ File %s was truncated (was %d bytes, now %d bytes)", fileName, oldSize, fileInfo.Size())
+
+	// Reset offset based on config
+	var newOffset int64
+	if f.config.config.DeepFlowStartFromEnd {
+		newOffset = fileInfo.Size()
+	} else {
+		newOffset = 0
+	}
+
+	f.mu.Lock()
+	f.fileOffsets[fileName] = newOffset
+	f.fileLastSize[fileName] = fileInfo.Size()
+	f.mu.Unlock()
+
+	// Read existing data if starting from beginning
+	if newOffset == 0 && fileInfo.Size() > 0 {
+		f.readNewLines(filePath, fileName, 0)
+	}
+}
+
+func (f *FileWatcher) readNewLines(filePath, fileName string, offset int64) {
+	// Open file
+	file, err := os.Open(filePath)
+	if err != nil {
+		log.Printf("Failed to open %s: %v", filePath, err)
+		return
+	}
+	defer file.Close()
+
+	// Seek to last position
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		log.Printf("Failed to seek in %s: %v", filePath, err)
+		return
+	}
+
+	// Read new lines
+	scanner := bufio.NewScanner(file)
+	// Handle large lines (up to 10MB per line)
+	buf := make([]byte, 0, 1024*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+
+	var lines []string
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("Error reading %s: %v", filePath, err)
+		return
+	}
+
+	// Get new offset (current position in file)
+	newOffset, err := file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		log.Printf("Failed to get new offset for %s: %v", filePath, err)
+		return
+	}
+
+	// Update file size
+	fileInfo, _ := os.Stat(filePath)
+
+	// CRITICAL: Only update offset if we actually read new data
+	if newOffset > offset {
+		f.mu.Lock()
+		f.fileOffsets[fileName] = newOffset
+		f.fileLastSize[fileName] = fileInfo.Size()
+		f.mu.Unlock()
+
+		if f.config.config.LogLevel == "debug" || len(lines) > 0 {
+			log.Printf("📖 Read %d new lines from %s (offset: %d -> %d, bytes read: %d)",
+				len(lines), fileName, offset, newOffset, newOffset-offset)
+		}
+	}
+
+	// Process the lines
+	if len(lines) > 0 {
+		f.processLines(lines, fileName)
+	}
+}
+
+func (f *FileWatcher) processLines(lines []string, source string) {
+	var l7Lines, l4Lines, metricsLines []string
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Route based on source file name
+		switch source {
+		case "l7_flow_log":
+			l7Lines = append(l7Lines, line)
+		case "l4_flow_log":
+			l4Lines = append(l4Lines, line)
+		case "flow_metrics":
+			metricsLines = append(metricsLines, line)
+		default:
+			// Auto-detect by content (fallback)
+			if strings.Contains(line, "request_domain") || strings.Contains(line, "response_code") {
+				l7Lines = append(l7Lines, line)
+			} else if strings.Contains(line, "byte_tx") && strings.Contains(line, "rtt") {
+				l4Lines = append(l4Lines, line)
+			} else if strings.Contains(line, "tagger") && strings.Contains(line, "meter") {
+				metricsLines = append(metricsLines, line)
+			}
+		}
+	}
+
+	// Process each type
+	if len(l7Lines) > 0 {
+		f.config.processL7Logs(l7Lines)
+		if f.config.config.LogLevel == "info" {
+			log.Printf("📝 Queued %d L7 logs from file", len(l7Lines))
+		}
+	}
+	if len(l4Lines) > 0 {
+		f.config.processL4Logs(l4Lines)
+		if f.config.config.LogLevel == "info" {
+			log.Printf("🔌 Queued %d L4 logs from file", len(l4Lines))
+		}
+	}
+	if len(metricsLines) > 0 {
+		f.config.processMetricsLogs(metricsLines)
+		if f.config.config.LogLevel == "info" {
+			log.Printf("📊 Queued %d metrics logs from file", len(metricsLines))
+		}
+	}
+}
+
+// Log Processing Methods
+func (p *Processor) processL7Logs(lines []string) {
+	hostname, _ := os.Hostname()
+
+	for _, dataStr := range lines {
+		var item map[string]interface{}
+		if err := json.Unmarshal([]byte(dataStr), &item); err != nil {
+			if p.config.LogLevel == "debug" {
+				log.Printf("Failed to parse L7 log: %v", err)
+			}
+			continue
+		}
+
+		// Flatten attributes
+		if attrs, ok := item["attributes"].(map[string]interface{}); ok {
+			for k, v := range attrs {
+				item["attr_"+k] = v
+			}
+			delete(item, "attributes")
+		}
+
+		// Flatten trace_ids
+		if traceIds, ok := item["trace_ids"].([]interface{}); ok && len(traceIds) > 0 {
+			if traceIdStr, ok := traceIds[0].(string); ok {
+				item["trace_id"] = traceIdStr
+			}
+			delete(item, "trace_ids")
+		}
+
+		item["eventType"] = "DeepFlowL7Log"
+		item["hostname"] = hostname
+		item["ingest_timestamp"] = time.Now().UnixMilli()
+
+		if duration, ok := item["response_duration"].(float64); ok {
+			item["response_duration_ms"] = duration / 1000.0
+		}
+
+		jsonBytes, err := json.Marshal(item)
+		if err != nil {
+			continue
+		}
+
+		if p.config.SaveDebugData {
+			p.l7Sender.saveToDebugFile(jsonBytes)
+		}
+		p.l7Sender.Add(json.RawMessage(jsonBytes))
+	}
+}
+
+func (p *Processor) processL4Logs(lines []string) {
+	hostname, _ := os.Hostname()
+
+	for _, dataStr := range lines {
+		var item map[string]interface{}
+		if err := json.Unmarshal([]byte(dataStr), &item); err != nil {
+			if p.config.LogLevel == "debug" {
+				log.Printf("Failed to parse L4 log: %v", err)
+			}
+			continue
+		}
+
+		item["eventType"] = "DeepFlowL4Log"
+		item["hostname"] = hostname
+		item["ingest_timestamp"] = time.Now().UnixMilli()
+
+		jsonBytes, err := json.Marshal(item)
+		if err != nil {
+			continue
+		}
+
+		if p.config.SaveDebugData {
+			p.l4Sender.saveToDebugFile(jsonBytes)
+		}
+		p.l4Sender.Add(json.RawMessage(jsonBytes))
+	}
+}
+
+func (p *Processor) processMetricsLogs(lines []string) {
+	hostname, _ := os.Hostname()
+
+	for _, dataStr := range lines {
+		var item map[string]interface{}
+		if err := json.Unmarshal([]byte(dataStr), &item); err != nil {
+			if p.config.LogLevel == "debug" {
+				log.Printf("Failed to parse metrics log: %v", err)
+			}
+			continue
+		}
+
+		flattened := flattenMetrics(item)
+		flattened["eventType"] = "DeepFlowMetrics"
+		flattened["hostname"] = hostname
+		flattened["ingest_timestamp"] = time.Now().UnixMilli()
+
+		jsonBytes, err := json.Marshal(flattened)
+		if err != nil {
+			continue
+		}
+
+		if p.config.SaveDebugData {
+			p.metricsSender.saveToDebugFile(jsonBytes)
+		}
+		p.metricsSender.Add(json.RawMessage(jsonBytes))
+	}
+}
+
+// HTTP Data Handler
 func (p *Processor) handleData(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -163,7 +748,6 @@ func (p *Processor) handleData(w http.ResponseWriter, r *http.Request) {
 	l7Count := 0
 	l4Count := 0
 	metricsCount := 0
-	httpbinL7Count := 0
 
 	for _, line := range lines {
 		line = strings.TrimSpace(line)
@@ -186,7 +770,7 @@ func (p *Processor) handleData(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			// FLATTEN attributes object
+			// Flatten attributes
 			if attrs, ok := item["attributes"].(map[string]interface{}); ok {
 				for k, v := range attrs {
 					item["attr_"+k] = v
@@ -194,7 +778,7 @@ func (p *Processor) handleData(w http.ResponseWriter, r *http.Request) {
 				delete(item, "attributes")
 			}
 
-			// FLATTEN trace_ids array
+			// Flatten trace_ids
 			if traceIds, ok := item["trace_ids"].([]interface{}); ok && len(traceIds) > 0 {
 				if traceIdStr, ok := traceIds[0].(string); ok {
 					item["trace_id"] = traceIdStr
@@ -202,18 +786,13 @@ func (p *Processor) handleData(w http.ResponseWriter, r *http.Request) {
 				delete(item, "trace_ids")
 			}
 
-			// Check if this is httpbin.org request
-			isHttpBin := false
-			if requestDomain, ok := item["request_domain"]; ok {
-				if domainStr, ok := requestDomain.(string); ok && domainStr == "httpbin.org" {
-					isHttpBin = true
-					httpbinL7Count++
-				}
-			}
-
 			item["eventType"] = "DeepFlowL7Log"
 			item["hostname"] = hostname
 			item["ingest_timestamp"] = time.Now().UnixMilli()
+
+			if duration, ok := item["response_duration"].(float64); ok {
+				item["response_duration_ms"] = duration / 1000.0
+			}
 
 			jsonBytes, err := json.Marshal(item)
 			if err != nil {
@@ -225,12 +804,6 @@ func (p *Processor) handleData(w http.ResponseWriter, r *http.Request) {
 			}
 			p.l7Sender.Add(json.RawMessage(jsonBytes))
 			l7Count++
-
-			if isHttpBin && p.config.LogLevel == "info" {
-				// Print flattened httpbin event
-				itemJSON, _ := json.MarshalIndent(item, "", "  ")
-				log.Printf("🔍 httpbin.org event (flattened):\n%s", string(itemJSON))
-			}
 
 		case "l4":
 			var item map[string]interface{}
@@ -277,15 +850,12 @@ func (p *Processor) handleData(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if httpbinL7Count > 0 {
-		log.Printf("✅ Processed %d httpbin.org L7 events (total L7: %d)", httpbinL7Count, l7Count)
-	}
-
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(fmt.Sprintf(`{"status":"ok","l7":%d,"l4":%d,"metrics":%d}`,
 		l7Count, l4Count, metricsCount)))
 }
 
+// Helper Functions
 func flattenMetrics(data map[string]interface{}) map[string]interface{} {
 	flattened := make(map[string]interface{})
 
@@ -311,20 +881,25 @@ func flattenMetrics(data map[string]interface{}) map[string]interface{} {
 	}
 
 	if meter, ok := data["meter"].(map[string]interface{}); ok {
-		if app, ok := meter["App"].(map[string]interface{}); ok {
-			if traffic, ok := app["traffic"].(map[string]interface{}); ok {
+		if flow, ok := meter["Flow"].(map[string]interface{}); ok {
+			if traffic, ok := flow["traffic"].(map[string]interface{}); ok {
 				for k, v := range traffic {
-					flattened["app_traffic_"+k] = v
+					flattened["traffic_"+k] = v
 				}
 			}
-			if latency, ok := app["latency"].(map[string]interface{}); ok {
+			if latency, ok := flow["latency"].(map[string]interface{}); ok {
 				for k, v := range latency {
-					flattened["app_latency_"+k] = v
+					flattened["latency_"+k] = v
 				}
 			}
-			if anomaly, ok := app["anomaly"].(map[string]interface{}); ok {
+			if performance, ok := flow["performance"].(map[string]interface{}); ok {
+				for k, v := range performance {
+					flattened["performance_"+k] = v
+				}
+			}
+			if anomaly, ok := flow["anomaly"].(map[string]interface{}); ok {
 				for k, v := range anomaly {
-					flattened["app_anomaly_"+k] = v
+					flattened["anomaly_"+k] = v
 				}
 			}
 		}
@@ -353,6 +928,11 @@ func toByte(v interface{}) byte {
 func (p *Processor) Stop() {
 	close(p.stopCh)
 
+	if p.fileWatcher != nil {
+		close(p.fileWatcher.stopCh)
+		p.fileWatcher.wg.Wait()
+	}
+
 	if p.l7Sender != nil {
 		p.l7Sender.Stop()
 	}
@@ -373,6 +953,7 @@ func (p *Processor) Stop() {
 	log.Println("Sidecar stopped")
 }
 
+// BatchSender Methods
 func NewBatchSender(nrClient *NewRelicClient, eventType string, config *Config) *BatchSender {
 	sender := &BatchSender{
 		logs:      make([]json.RawMessage, 0, config.BatchSize),
@@ -459,47 +1040,20 @@ func (b *BatchSender) flushLocked() {
 		return
 	}
 
-	// Only log if this is L7 and might contain httpbin.org
-	if b.eventType == "DeepFlowL7Log" && b.config.LogLevel == "info" {
-		// Check if any event in batch is httpbin.org
-		hasHttpBin := false
-		for _, log := range b.logs {
-			var item map[string]interface{}
-			if err := json.Unmarshal(log, &item); err == nil {
-				if requestDomain, ok := item["request_domain"]; ok {
-					if domainStr, ok := requestDomain.(string); ok && domainStr == "httpbin.org" {
-						hasHttpBin = true
-						break
-					}
-				}
-			}
-		}
-		if hasHttpBin {
-			log.Printf("📤 Sending batch with %d L7 events (including httpbin.org)", len(b.logs))
-		}
-	}
-
 	err := b.nrClient.SendLogs(b.logs)
 	if err != nil {
 		log.Printf("❌ Failed to send %s events: %v", b.eventType, err)
 	} else {
 		b.totalSent += int64(len(b.logs))
-		// Only log for L7 events that might be httpbin.org
-		if b.eventType == "DeepFlowL7Log" {
-			// log.Printf("✅ Sent %d L7 events (total L7 sent: %d)", len(b.logs), b.totalSent)
+		if b.config.LogLevel == "debug" {
+			log.Printf("✅ Sent %d %s events (total: %d)", len(b.logs), b.eventType, b.totalSent)
 		}
 	}
 
 	b.logs = b.logs[:0]
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
+// Helper functions
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
