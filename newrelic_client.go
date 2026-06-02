@@ -21,9 +21,6 @@ type NewRelicClient struct {
 func NewNewRelicClient(licenseKey, accountID string, debugMode bool) *NewRelicClient {
 	endpoint := fmt.Sprintf("https://insights-collector.newrelic.com/v1/accounts/%s/events", accountID)
 
-	// 如果是 EU 区域，使用不同的端点
-	// endpoint := fmt.Sprintf("https://insights-collector.eu01.nr-data.net/v1/accounts/%s/events", accountID)
-
 	client := &NewRelicClient{
 		licenseKey: licenseKey,
 		endpoint:   endpoint,
@@ -62,27 +59,23 @@ func (c *NewRelicClient) SendLogs(events []json.RawMessage) error {
 		payload = append(payload, eventMap)
 	}
 
-	// Check if this batch contains any httpbin.org events
+	// Check if this batch contains any httpbin.org events (only if debug mode)
 	hasHttpBin := false
 	httpBinEvents := []map[string]interface{}{}
-	for _, event := range payload {
-		if requestDomain, ok := event["request_domain"]; ok {
-			if domainStr, ok := requestDomain.(string); ok && domainStr == "httpbin.org" {
-				hasHttpBin = true
-				httpBinEvents = append(httpBinEvents, event)
+	if c.debugMode {
+		for _, event := range payload {
+			if requestDomain, ok := event["request_domain"]; ok {
+				if domainStr, ok := requestDomain.(string); ok && domainStr == "httpbin.org" {
+					hasHttpBin = true
+					httpBinEvents = append(httpBinEvents, event)
+				}
 			}
 		}
 	}
 
-	// Only log if this batch has httpbin.org events
-	if hasHttpBin {
-		log.Printf("📤 Sending batch with %d L7 events (including %d httpbin.org events)", len(payload), len(httpBinEvents))
-
-		// Print each httpbin.org event
-		for i, event := range httpBinEvents {
-			eventJSON, _ := json.MarshalIndent(event, "", "  ")
-			log.Printf("🔍 httpbin.org event #%d:\n%s", i+1, string(eventJSON))
-		}
+	// Only log if this batch has httpbin.org events and debug mode is on
+	if hasHttpBin && c.debugMode {
+		log.Printf("📤 Sending batch with %d events (including %d httpbin.org events)", len(payload), len(httpBinEvents))
 	}
 
 	body, err := json.Marshal(payload)
@@ -98,10 +91,9 @@ func (c *NewRelicClient) SendLogs(events []json.RawMessage) error {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Api-Key", c.licenseKey)
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := c.client.Do(req)
 	if err != nil {
-		if hasHttpBin {
+		if hasHttpBin && c.debugMode {
 			log.Printf("❌ HTTP request failed for httpbin.org batch: %v", err)
 		}
 		return err
@@ -110,26 +102,15 @@ func (c *NewRelicClient) SendLogs(events []json.RawMessage) error {
 
 	respBody, _ := io.ReadAll(resp.Body)
 
-	if hasHttpBin {
-		log.Printf("📬 New Relic response for httpbin.org batch: status=%d, body=%s", resp.StatusCode, string(respBody))
+	if hasHttpBin && c.debugMode {
+		log.Printf("📬 New Relic response: status=%d, body=%s", resp.StatusCode, string(respBody))
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		if hasHttpBin {
-			log.Printf("❌ New Relic rejected httpbin.org events: %d - %s", resp.StatusCode, string(respBody))
+		if hasHttpBin && c.debugMode {
+			log.Printf("❌ New Relic rejected events: %d - %s", resp.StatusCode, string(respBody))
 		}
 		return fmt.Errorf("New Relic returned %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var nrResponse struct {
-		Success bool `json:"success"`
-	}
-	if err := json.Unmarshal(respBody, &nrResponse); err == nil {
-		if nrResponse.Success && hasHttpBin {
-			log.Printf("✅ New Relic accepted %d events (including %d httpbin.org events)", len(payload), len(httpBinEvents))
-		} else if !nrResponse.Success && hasHttpBin {
-			log.Printf("⚠️ New Relic rejected httpbin.org events: %s", string(respBody))
-		}
 	}
 
 	return nil
