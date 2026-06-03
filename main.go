@@ -688,6 +688,50 @@ func (p *Processor) processL4Logs(lines []string) {
 			continue
 		}
 
+		// Add duration_ms if duration field exists (duration is in microseconds)
+		if duration, ok := item["duration"].(float64); ok {
+			item["duration_ms"] = duration / 1000.0
+		}
+
+		// Add rtt_ms if rtt fields exist (rtt is in microseconds)
+		if rtt, ok := item["rtt"].(float64); ok {
+			item["rtt_ms"] = rtt / 1000.0
+		}
+		if rttClientMax, ok := item["rtt_client_max"].(float64); ok {
+			item["rtt_client_max_ms"] = rttClientMax / 1000.0
+		}
+		if rttServerMax, ok := item["rtt_server_max"].(float64); ok {
+			item["rtt_server_max_ms"] = rttServerMax / 1000.0
+		}
+
+		// Add throughput in Mbps for better analysis
+		if byteTx, ok := item["byte_tx"].(float64); ok {
+			if duration, ok := item["duration"].(float64); ok && duration > 0 {
+				throughputMbps := (byteTx * 8) / (duration / 1000000.0) / 1000000.0
+				item["throughput_tx_mbps"] = throughputMbps
+			}
+		}
+		if byteRx, ok := item["byte_rx"].(float64); ok {
+			if duration, ok := item["duration"].(float64); ok && duration > 0 {
+				throughputMbps := (byteRx * 8) / (duration / 1000000.0) / 1000000.0
+				item["throughput_rx_mbps"] = throughputMbps
+			}
+		}
+
+		// Add retransmission rate if packet counts exist
+		if packetTx, ok := item["packet_tx"].(float64); ok {
+			if retransTx, ok := item["retrans_tx"].(float64); ok && packetTx > 0 {
+				retransRate := (retransTx / packetTx) * 100
+				item["retransmission_rate_tx_pct"] = retransRate
+			}
+		}
+		if packetRx, ok := item["packet_rx"].(float64); ok {
+			if retransRx, ok := item["retrans_rx"].(float64); ok && packetRx > 0 {
+				retransRate := (retransRx / packetRx) * 100
+				item["retransmission_rate_rx_pct"] = retransRate
+			}
+		}
+
 		item["eventType"] = "DeepFlowL4Log"
 		item["hostname"] = hostname
 		item["ingest_timestamp"] = time.Now().UnixMilli()
@@ -706,6 +750,8 @@ func (p *Processor) processL4Logs(lines []string) {
 
 func (p *Processor) processMetricsLogs(lines []string) {
 	hostname, _ := os.Hostname()
+	count := 0
+	httpBinCount := 0
 
 	for _, dataStr := range lines {
 		var item map[string]interface{}
@@ -721,6 +767,16 @@ func (p *Processor) processMetricsLogs(lines []string) {
 		flattened["hostname"] = hostname
 		flattened["ingest_timestamp"] = time.Now().UnixMilli()
 
+		// Check if this is httpbin.org related for debugging
+		if endpoint, ok := flattened["tagger_endpoint"]; ok {
+			if endpointStr, ok := endpoint.(string); ok && strings.Contains(endpointStr, "httpbin") {
+				httpBinCount++
+				if p.config.LogLevel == "debug" {
+					log.Printf("🔍 httpbin.org metrics: %v", flattened)
+				}
+			}
+		}
+
 		jsonBytes, err := json.Marshal(flattened)
 		if err != nil {
 			continue
@@ -730,6 +786,11 @@ func (p *Processor) processMetricsLogs(lines []string) {
 			p.metricsSender.saveToDebugFile(jsonBytes)
 		}
 		p.metricsSender.Add(json.RawMessage(jsonBytes))
+		count++
+	}
+
+	if count > 0 && p.config.LogLevel == "info" {
+		log.Printf("📊 Processed %d metrics logs from file (httpbin: %d)", count, httpBinCount)
 	}
 }
 
@@ -811,6 +872,36 @@ func (p *Processor) handleData(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
+			// Add duration_ms if duration field exists (duration is in microseconds)
+			if duration, ok := item["duration"].(float64); ok {
+				item["duration_ms"] = duration / 1000.0
+			}
+
+			// Add rtt_ms if rtt fields exist
+			if rtt, ok := item["rtt"].(float64); ok {
+				item["rtt_ms"] = rtt / 1000.0
+			}
+			if rttClientMax, ok := item["rtt_client_max"].(float64); ok {
+				item["rtt_client_max_ms"] = rttClientMax / 1000.0
+			}
+			if rttServerMax, ok := item["rtt_server_max"].(float64); ok {
+				item["rtt_server_max_ms"] = rttServerMax / 1000.0
+			}
+
+			// Add throughput in Mbps
+			if byteTx, ok := item["byte_tx"].(float64); ok {
+				if duration, ok := item["duration"].(float64); ok && duration > 0 {
+					throughputMbps := (byteTx * 8) / (duration / 1000000.0) / 1000000.0
+					item["throughput_tx_mbps"] = throughputMbps
+				}
+			}
+			if byteRx, ok := item["byte_rx"].(float64); ok {
+				if duration, ok := item["duration"].(float64); ok && duration > 0 {
+					throughputMbps := (byteRx * 8) / (duration / 1000000.0) / 1000000.0
+					item["throughput_rx_mbps"] = throughputMbps
+				}
+			}
+
 			item["eventType"] = "DeepFlowL4Log"
 			item["hostname"] = hostname
 			item["ingest_timestamp"] = time.Now().UnixMilli()
@@ -859,13 +950,21 @@ func (p *Processor) handleData(w http.ResponseWriter, r *http.Request) {
 func flattenMetrics(data map[string]interface{}) map[string]interface{} {
 	flattened := make(map[string]interface{})
 
+	// Add timestamp
 	if ts, ok := data["timestamp"]; ok {
 		flattened["timestamp"] = ts
 	}
 
+	// Flatten tagger fields
 	if tagger, ok := data["tagger"].(map[string]interface{}); ok {
 		for k, v := range tagger {
 			if k == "code" {
+				// Handle code.bits specially
+				if codeMap, ok := v.(map[string]interface{}); ok {
+					if bits, ok := codeMap["bits"]; ok {
+						flattened["tagger_code_bits"] = bits
+					}
+				}
 				continue
 			}
 			if k == "mac" || k == "mac1" {
@@ -880,35 +979,91 @@ func flattenMetrics(data map[string]interface{}) map[string]interface{} {
 		}
 	}
 
+	// Flatten meter fields - handle both Flow and App metrics
 	if meter, ok := data["meter"].(map[string]interface{}); ok {
+		// Handle App metrics (L7 application metrics)
+		if app, ok := meter["App"].(map[string]interface{}); ok {
+			// Flatten App traffic
+			if traffic, ok := app["traffic"].(map[string]interface{}); ok {
+				for k, v := range traffic {
+					flattened["app_traffic_"+k] = v
+				}
+			}
+			// Flatten App latency
+			if latency, ok := app["latency"].(map[string]interface{}); ok {
+				for k, v := range latency {
+					// Convert RRT from microseconds to milliseconds if needed
+					if (k == "rrt_max" || k == "rrt_sum") && v != nil {
+						if rrtVal, ok := v.(float64); ok {
+							flattened["app_latency_"+k] = rrtVal
+							flattened["app_latency_"+k+"_ms"] = rrtVal / 1000.0
+						} else {
+							flattened["app_latency_"+k] = v
+						}
+					} else {
+						flattened["app_latency_"+k] = v
+					}
+				}
+			}
+			// Flatten App anomaly
+			if anomaly, ok := app["anomaly"].(map[string]interface{}); ok {
+				for k, v := range anomaly {
+					flattened["app_anomaly_"+k] = v
+				}
+			}
+		}
+
+		// Handle Flow metrics (L4 network metrics)
 		if flow, ok := meter["Flow"].(map[string]interface{}); ok {
+			// Flatten Flow traffic
 			if traffic, ok := flow["traffic"].(map[string]interface{}); ok {
 				for k, v := range traffic {
-					flattened["traffic_"+k] = v
+					flattened["flow_traffic_"+k] = v
 				}
 			}
+			// Flatten Flow latency
 			if latency, ok := flow["latency"].(map[string]interface{}); ok {
 				for k, v := range latency {
-					flattened["latency_"+k] = v
+					flattened["flow_latency_"+k] = v
 				}
 			}
+			// Flatten Flow performance
 			if performance, ok := flow["performance"].(map[string]interface{}); ok {
 				for k, v := range performance {
-					flattened["performance_"+k] = v
+					flattened["flow_performance_"+k] = v
 				}
 			}
+			// Flatten Flow anomaly
 			if anomaly, ok := flow["anomaly"].(map[string]interface{}); ok {
 				for k, v := range anomaly {
-					flattened["anomaly_"+k] = v
+					flattened["flow_anomaly_"+k] = v
 				}
 			}
 		}
 	}
 
+	// Add flags
 	if flags, ok := data["flags"].(map[string]interface{}); ok {
 		if bits, ok := flags["bits"]; ok {
 			flattened["flags_bits"] = bits
 		}
+	}
+
+	// Add calculated fields for App metrics
+	if appTrafficRequest, ok := flattened["app_traffic_request"].(float64); ok {
+		flattened["has_requests"] = appTrafficRequest > 0
+	}
+	if appLatencyRrtMaxMs, ok := flattened["app_latency_rrt_max_ms"].(float64); ok {
+		flattened["app_response_time_ms"] = appLatencyRrtMaxMs
+	}
+	if appAnomalyClientError, ok := flattened["app_anomaly_client_error"].(float64); ok {
+		flattened["has_client_errors"] = appAnomalyClientError > 0
+	}
+	if appAnomalyServerError, ok := flattened["app_anomaly_server_error"].(float64); ok {
+		flattened["has_server_errors"] = appAnomalyServerError > 0
+	}
+	if appAnomalyTimeout, ok := flattened["app_anomaly_timeout"].(float64); ok {
+		flattened["has_timeouts"] = appAnomalyTimeout > 0
 	}
 
 	return flattened
