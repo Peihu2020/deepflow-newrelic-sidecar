@@ -1,119 +1,115 @@
 log-file: /var/log/deepflow-agent/deepflow-agent.log
 log-level: info
 global:
-  limits:
-    max_memory: 1024      # 1536 MiB = 1.5 GB ✅
-    max_millicpus: 1000   # 2000 millicpus = 2 cores ✅
+  limits:
+    max_memory: 1024      # 1536 MiB = 1.5 GB ✅
+    max_millicpus: 1000   # 2000 millicpus = 2 cores ✅
 
- 
-
-  standalone_mode:
-    max_data_file_size: 100      # 10 MiB ✅
-    data_file_dir: /var/log/deepflow-agent/   # ✅
+  standalone_mode:
+    max_data_file_size: 100      # 10 MiB ✅
+    data_file_dir: /var/log/deepflow-agent/   # ✅
 static_config:
-  ebpf:
-    enabled: true
-    socket:
-      uprobe:
-        tls:
-          enabled: true
-        golang:
-          enabled: true
-    profile:
-      on_cpu:
-        disabled: true
-        sampling_frequency: 99
+  ebpf:
+    enabled: true
+    socket:
+      uprobe:
+        tls:
+          enabled: true
+        golang:
+          enabled: true
+    profile:
+      on_cpu:
+        disabled: true
+        sampling_frequency: 99
 inputs:
-  proc:
-    process_matcher:
-      # Match httpd processes
-      - match_regex: ^httpd$
-        match_type: process_name
-        only_in_container: false
-        enabled_features:
-          - ebpf.socket.uprobe.tls   # Enable TLS/HTTPS decryption
-          - proc.gprocess_info        # Enable process info sync
-  cbpf:
-    af_packet:
-      interface_regex:  ^(eth.*|en.*|veth.*)$
-  ebpf:
-    disabled: false
-    profile:
-      on_cpu:
-        disabled: true
-    socket:
-      uprobe:
-        tls:
-          enabled: true
-      tunning:
-        syscall_trace_id_disabled: false
+  proc:
+    process_matcher:
+      # Match httpd processes
+      - match_regex: ^httpd$
+        match_type: process_name
+        only_in_container: false
+        enabled_features:
+          - ebpf.socket.uprobe.tls   # Enable TLS/HTTPS decryption
+          - proc.gprocess_info        # Enable process info sync
+  cbpf:
+    af_packet:
+      interface_regex:  ^(eth.*|en.*|veth.*)$
+  ebpf:
+    disabled: false
+    profile:
+      on_cpu:
+        disabled: true
+    socket:
+      uprobe:
+        tls:
+          enabled: true
+      tunning:
+        syscall_trace_id_disabled: false
 processors:
-  request_log:
-    timeouts:
-      tcp_request_timeout: 1800s
-      session_aggregate:
-      - protocol: HTTP
-        timeout: 1800s
-    tunning:
-      payload_truncation: 16384   # 从 1024 改为 16384 (16KB)
-    application_protocol_inference:
-        enabled_protocols:
-          - HTTP
-          - HTTP2
-          - TLS
-          - MySQL
-          - PostgreSQL
-          - Redis
-          - MongoDB
-          - Oracle
-          - Kafka
-          - Memcached
-    tag_extraction:
-      tracing_tag:
-        multiple_trace_id_collection: true
-        apm_trace_id:
-          - traceparent      # W3C Trace Context: 00-TRACEID-SPANID-01
-          - sw8              # SkyWalking v8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
-          - sw6              # SkyWalking v6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
-          - sw3              # SkyWalking v3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING
-          - uber-trace-id    # Jaeger: TRACEID:SPANID:PARENTSPANID:FLAGS
-          - b3               # Zipkin B3: TRACEID-SPANID-1
-          - X-B3-TraceId     # Alternative B3 header format
-          - X-Request-Id     # Common request ID header
-        apm_span_id:
-          - traceparent      # W3C format: 00-TRACEID-SPANID-01
-          - sw8              # SkyWalking v8 format
-          - sw6              # SkyWalking v6 format
-          - uber-trace-id    # Jaeger format
-          - b3               # Zipkin B3 format: TRACEID-SPANID-1
-          - X-B3-SpanId      # Alternative B3 header format
-        http_real_client:
-          - X_Forwarded_For
-          - X-Real-IP
-          - True-Client-IP
-        x_request_id:
-          - X_Request_ID
-          - X-Request-Id
-        copy_apm_trace_id: true
-      custom_fields:
-        HTTP:
-          - field_name: "traceparent"
-          - field_name: "x-request-id"
-          - field_name: "x-b3-traceid"
-          - field_name: "x-b3-spanid"
-        HTTP2:
-          - field_name: "traceparent"
-          - field_name: "x-request-id"
-
- 
+  request_log:
+    timeouts:
+      tcp_request_timeout: 1800s
+      session_aggregate:
+      - protocol: HTTP
+        timeout: 1800s
+    tunning:
+      payload_truncation: 16384   # 从 1024 改为 16384 (16KB)
+    application_protocol_inference:
+        enabled_protocols:
+          - HTTP
+          - HTTP2
+          - TLS
+          - MySQL
+          - PostgreSQL
+          - Redis
+          - MongoDB
+          - Oracle
+          - Kafka
+          - Memcached
+    tag_extraction:
+      tracing_tag:
+        multiple_trace_id_collection: true
+        apm_trace_id:
+          - traceparent      # W3C Trace Context: 00-TRACEID-SPANID-01
+          - sw8              # SkyWalking v8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
+          - sw6              # SkyWalking v6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
+          - sw3              # SkyWalking v3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING
+          - uber-trace-id    # Jaeger: TRACEID:SPANID:PARENTSPANID:FLAGS
+          - b3               # Zipkin B3: TRACEID-SPANID-1
+          - X-B3-TraceId     # Alternative B3 header format
+          - X-Request-Id     # Common request ID header
+        apm_span_id:
+          - traceparent      # W3C format: 00-TRACEID-SPANID-01
+          - sw8              # SkyWalking v8 format
+          - sw6              # SkyWalking v6 format
+          - uber-trace-id    # Jaeger format
+          - b3               # Zipkin B3 format: TRACEID-SPANID-1
+          - X-B3-SpanId      # Alternative B3 header format
+        http_real_client:
+          - X_Forwarded_For
+          - X-Real-IP
+          - True-Client-IP
+        x_request_id:
+          - X_Request_ID
+          - X-Request-Id
+        copy_apm_trace_id: true
+      custom_fields:
+        HTTP:
+          - field_name: "traceparent"
+          - field_name: "x-request-id"
+          - field_name: "x-b3-traceid"
+          - field_name: "x-b3-spanid"
+        HTTP2:
+          - field_name: "traceparent"
+          - field_name: "x-request-id"
 
 outputs:
-  flow_log:
-    throttles:
-      l4_throttle: 1000000
-      l7_throttle: 1000000
-  http_forward:
-    enabled: false
-    url: "http://127.0.0.1:8080/api/deepflow-data"
-    timeout_seconds: 5
-    batch_size: 1
+  flow_log:
+    throttles:
+      l4_throttle: 1000000
+      l7_throttle: 1000000
+  http_forward:
+    enabled: false
+    url: "http://127.0.0.1:8080/api/deepflow-data"
+    timeout_seconds: 5
+    batch_size: 1
