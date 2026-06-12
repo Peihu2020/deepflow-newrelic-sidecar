@@ -58,10 +58,11 @@ type Config struct {
 // ============================================================================
 
 type NewRelicClient struct {
-	license   string
-	accountID string
-	client    *http.Client
-	debug     bool
+	license    string
+	accountID  string
+	client     *http.Client
+	debug      bool
+	errorCount int64
 }
 
 func NewNewRelicClient(license, accountID string, debug bool) *NewRelicClient {
@@ -122,6 +123,19 @@ func (c *NewRelicClient) SendLogs(logs []json.RawMessage) error {
 		return nil
 	}
 
+	// 413 错误只每 100 次打印一次
+	if resp.StatusCode == 413 {
+		atomic.AddInt64(&c.errorCount, 1)
+		if atomic.LoadInt64(&c.errorCount)%100 == 1 {
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("[WARN] HTTP 413 (payload too large) - errors: %d", atomic.LoadInt64(&c.errorCount))
+			if len(body) > 0 && c.debug {
+				log.Printf("[DEBUG] Response: %s", string(body))
+			}
+		}
+		return fmt.Errorf("HTTP 413")
+	}
+
 	body, _ := io.ReadAll(resp.Body)
 	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 }
@@ -145,6 +159,7 @@ type BatchSender struct {
 	dropped      int64
 	maxQueueSize int
 	enabled      bool
+	errorCount   int64
 }
 
 func NewBatchSender(nrClient *NewRelicClient, eventType string, config *Config, enabled bool) *BatchSender {
@@ -275,7 +290,12 @@ func (b *BatchSender) flushLocked() {
 
 	err := b.nrClient.SendLogs(b.logs)
 	if err != nil {
-		log.Printf("[ERROR] Failed to send %s events: %v", b.eventType, err)
+		// 每 100 次错误打印一次
+		atomic.AddInt64(&b.errorCount, 1)
+		if atomic.LoadInt64(&b.errorCount)%100 == 1 {
+			log.Printf("[ERROR] Failed to send %s events: %v (total errors: %d)",
+				b.eventType, err, atomic.LoadInt64(&b.errorCount))
+		}
 		return
 	}
 
