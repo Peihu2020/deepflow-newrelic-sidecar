@@ -16,4 +16,5 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/newrelic/go-agent/v3 v3.43.3
 	golang.org/x/sys v0.40.0 // indirect
+	golang.org/x/time v0.15.0
 )
