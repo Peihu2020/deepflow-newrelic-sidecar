@@ -10,11 +10,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"runtime/debug"
 
 	"github.com/joho/godotenv"
 	"golang.org/x/time/rate"
@@ -887,6 +890,18 @@ func main() {
 	}
 
 	processor.startHTTPServer()
+
+	// ========== 在这里添加 GC 定期回收 ==========
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			runtime.GC()
+			debug.FreeOSMemory()
+			log.Printf("[INFO] Forced GC, memory released")
+		}
+	}()
+	// =========================================
 
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)

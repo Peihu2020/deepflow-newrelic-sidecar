@@ -22,22 +22,42 @@ static_config:
         disabled: true
         sampling_frequency: 99
 inputs:
+  proc:
+    process_matcher:
+      # Match httpd processes
+      - match_regex: ^httpd$
+        match_type: process_name
+        only_in_container: false
+        enabled_features:
+          - ebpf.socket.uprobe.tls   # Enable TLS/HTTPS decryption
+          - proc.gprocess_info        # Enable process info sync
   cbpf:
     af_packet:
       interface_regex:  ^(eth.*|en.*|veth.*)$
   ebpf:
+    disabled: false
+    profile:
+      on_cpu:
+        disabled: true
     socket:
+      uprobe:
+        tls:
+          enabled: true
       tunning:
         syscall_trace_id_disabled: false
 processors:
   request_log:
+    timeouts:
+      tcp_request_timeout: 1800s
+      session_aggregate:
+      - protocol: HTTP
+        timeout: 1800s
     tunning:
       payload_truncation: 16384   # 从 1024 改为 16384 (16KB)
     application_protocol_inference:
         enabled_protocols:
           - HTTP
           - HTTP2
-          - DNS
           - TLS
           - MySQL
           - PostgreSQL
@@ -66,7 +86,7 @@ processors:
           - b3               # Zipkin B3 format: TRACEID-SPANID-1
           - X-B3-SpanId      # Alternative B3 header format
         http_real_client:
-          - X_Forwarded_For
+          - X-Forwarded-For
           - X-Real-IP
           - True-Client-IP
         x_request_id:
@@ -84,8 +104,13 @@ processors:
           - field_name: "x-request-id"
 
 outputs:
+  flow_log:
+    throttles:
+      l4_throttle: 10000
+      l7_throttle: 10000
   http_forward:
     enabled: true
     url: "http://127.0.0.1:8080/api/deepflow-data"
-    timeout_seconds: 5
-    batch_size: 1
+    timeout_seconds: 30
+    batch_size: 100
+    queue_size: 20000
