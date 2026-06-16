@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -68,37 +69,81 @@ func NewKafkaProducer(config *Config) (*KafkaProducer, error) {
 	// 启动错误处理协程
 	go kp.handleErrors()
 
-	// 可选：启动成功确认协程（如果需要记录成功）
-	// go kp.handleSuccesses()
-
 	log.Printf("[INFO] Kafka AsyncProducer initialized: brokers=%v, topic=%s, compression=snappy",
 		config.KafkaBrokers, config.KafkaTopic)
 
 	return kp, nil
 }
 
-// 处理异步发送的错误
+// 处理异步发送的错误 - 增强调试
 func (kp *KafkaProducer) handleErrors() {
 	for err := range kp.producer.Errors() {
 		atomic.AddInt64(&kp.errorCount, 1)
-		if atomic.LoadInt64(&kp.errorCount)%100 == 1 {
-			log.Printf("[ERROR] Kafka producer error: %v (total errors: %d)",
-				err.Err, atomic.LoadInt64(&kp.errorCount))
+		errorCount := atomic.LoadInt64(&kp.errorCount)
+		sentCount := atomic.LoadInt64(&kp.sentCount)
+
+		// ========== 详细错误信息 ==========
+		log.Printf("[ERROR] 🔥 Kafka producer error #%d:", errorCount)
+		log.Printf("[ERROR]   Error: %v", err.Err)
+		log.Printf("[ERROR]   Topic: %s", err.Msg.Topic)
+		log.Printf("[ERROR]   Partition: %d", err.Msg.Partition)
+
+		// 打印消息内容前100字符
+		if err.Msg.Value != nil {
+			value, _ := err.Msg.Value.Encode()
+			preview := string(value)
+			if len(preview) > 100 {
+				preview = preview[:100] + "..."
+			}
+			log.Printf("[ERROR]   Message size: %d bytes", len(value))
+			log.Printf("[ERROR]   Message preview: %s", preview)
+		}
+
+		// 判断错误类型
+		errMsg := err.Err.Error()
+		switch {
+		case err.Err == sarama.ErrMessageSizeTooLarge:
+			log.Printf("[ERROR] ⚠️ 消息太大！检查 KAFKA_MAX_MESSAGE_BYTES 配置")
+		case err.Err == sarama.ErrBrokerNotAvailable:
+			log.Printf("[ERROR] ⚠️ Broker 不可用！检查 Kafka 连接")
+		case err.Err == sarama.ErrUnknownTopicOrPartition:
+			log.Printf("[ERROR] ⚠️ Topic 不存在！检查 topic: %s", kp.topic)
+		case err.Err == sarama.ErrNotEnoughReplicas:
+			log.Printf("[ERROR] ⚠️ 副本不足！检查 replication factor")
+		case err.Err == sarama.ErrNotEnoughReplicasAfterAppend:
+			log.Printf("[ERROR] ⚠️ 写入后副本不足！检查 ISR")
+		case err.Err == sarama.ErrLeaderNotAvailable:
+			log.Printf("[ERROR] ⚠️ Leader 不可用！检查 Kafka 集群状态")
+		case err.Err == sarama.ErrTopicAuthorizationFailed:
+			log.Printf("[ERROR] ⚠️ 授权失败！检查 Kafka ACL")
+		default:
+			// 检查是否包含 timeout 关键字
+			if strings.Contains(errMsg, "timeout") || strings.Contains(errMsg, "Timeout") {
+				log.Printf("[ERROR] ⚠️ 超时错误！检查网络或增加 KAFKA_PRODUCER_TIMEOUT")
+			} else {
+				log.Printf("[ERROR] ⚠️ 未知错误类型: %v", err.Err)
+			}
+		}
+
+		// 每50个错误打印统计
+		if errorCount%50 == 0 {
+			total := sentCount + errorCount
+			errorRate := float64(errorCount) / float64(total) * 100
+			log.Printf("[ERROR] 📊 错误统计: %d 错误 / %d 总消息 (%.2f%% 错误率)",
+				errorCount, total, errorRate)
 		}
 	}
 }
 
-// 可选：处理成功确认（用于统计）
-func (kp *KafkaProducer) handleSuccesses() {
-	for range kp.producer.Successes() {
-		atomic.AddInt64(&kp.sentCount, 1)
-	}
-}
-
-// 异步发送消息
+// 异步发送消息 - 添加日志
 func (kp *KafkaProducer) Send(data []byte) error {
 	if !kp.enabled || kp.closed.Load() {
 		return nil
+	}
+
+	sent := atomic.AddInt64(&kp.sentCount, 1)
+	if sent%1000 == 0 {
+		log.Printf("[DEBUG] 📤 Producer sent %d messages (size: %d bytes)", sent, len(data))
 	}
 
 	msg := &sarama.ProducerMessage{
@@ -107,16 +152,9 @@ func (kp *KafkaProducer) Send(data []byte) error {
 		Timestamp: time.Now(),
 	}
 
-	// 异步发送：将消息放入 channel，立即返回
-	select {
-	case kp.producer.Input() <- msg:
-		atomic.AddInt64(&kp.sentCount, 1)
-		return nil
-	default:
-		// 如果 channel 满了，记录错误
-		atomic.AddInt64(&kp.errorCount, 1)
-		return nil
-	}
+	// ========== 移除 default，阻塞等待 ==========
+	kp.producer.Input() <- msg
+	return nil
 }
 
 func (kp *KafkaProducer) GetStats() (sent, errors int64) {
