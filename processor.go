@@ -86,33 +86,43 @@ func (p *Processor) Stop() {
 }
 
 func (p *Processor) ProcessKafkaMessage(data []byte) {
-	parts := strings.SplitN(string(data), "|", 2)
-	if len(parts) != 2 {
-		return
-	}
+	// 按行分割
+	lines := strings.Split(string(data), "\n")
 
-	dataType := parts[0]
-	dataStr := parts[1]
-
-	hostname, _ := os.Hostname()
-
-	switch dataType {
-	case "l7":
-		if p.config.EnableL7 {
-			if jsonBytes := p.processL7Line(dataStr, hostname); jsonBytes != nil {
-				p.l7Sender.Add(jsonBytes)
-			}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
 		}
-	case "l4":
-		if p.config.EnableL4 {
-			if jsonBytes := p.processL4Line(dataStr, hostname); jsonBytes != nil {
-				p.l4Sender.Add(jsonBytes)
-			}
+
+		parts := strings.SplitN(line, "|", 2)
+		if len(parts) != 2 {
+			continue
 		}
-	case "metrics":
-		if p.config.EnableMetrics {
-			if jsonBytes := p.processMetricsLine(dataStr, hostname); jsonBytes != nil {
-				p.metricsSender.Add(jsonBytes)
+
+		dataType := parts[0]
+		dataStr := parts[1]
+
+		hostname, _ := os.Hostname()
+
+		switch dataType {
+		case "l7":
+			if p.config.EnableL7 {
+				if jsonBytes := p.processL7Line(dataStr, hostname); jsonBytes != nil {
+					p.l7Sender.Add(jsonBytes)
+				}
+			}
+		case "l4":
+			if p.config.EnableL4 {
+				if jsonBytes := p.processL4Line(dataStr, hostname); jsonBytes != nil {
+					p.l4Sender.Add(jsonBytes)
+				}
+			}
+		case "metrics":
+			if p.config.EnableMetrics {
+				if jsonBytes := p.processMetricsLine(dataStr, hostname); jsonBytes != nil {
+					p.metricsSender.Add(jsonBytes)
+				}
 			}
 		}
 	}

@@ -16,6 +16,11 @@ import (
 func main() {
 	godotenv.Load()
 	config := LoadConfig()
+
+	// ========== 打印 ConsumerOnlyMode 状态 ==========
+	if config.ConsumerOnlyMode {
+		log.Printf("⚠️  Running in CONSUMER-ONLY mode: HTTP requests will be rejected")
+	}
 	fmt.Fprintf(os.Stderr, "[DEBUG] Main - KafkaBrokers: %v\n", config.KafkaBrokers)
 	if config.NewRelicLicense == "" || config.NewRelicAccountID == "" {
 		log.Fatal("NEW_RELIC_LICENSE_KEY and NEW_RELIC_ACCOUNT_ID are required")
@@ -40,21 +45,24 @@ func main() {
 
 	processor := NewProcessor(config, nrClient)
 
-	// Initialize Kafka Producer
-	kafkaProducer, err := NewKafkaProducer(config)
-	if err != nil {
-		log.Printf("[WARN] Failed to create Kafka producer: %v", err)
-	} else {
-		processor.kafkaProducer = kafkaProducer
+	// ========== 初始化 Kafka Producer（独立） ==========
+	if config.KafkaProducerEnabled {
+		kafkaProducer, err := NewKafkaProducer(config)
+		if err != nil {
+			log.Printf("[WARN] Failed to create Kafka producer: %v", err)
+		} else {
+			processor.kafkaProducer = kafkaProducer
+		}
 	}
 
-	// Initialize Kafka Consumer
-	if processor.kafkaProducer != nil && processor.kafkaProducer.enabled {
+	// ========== 初始化 Kafka Consumer（独立，不依赖 Producer） ==========
+	if config.KafkaConsumerEnabled {
 		kafkaConsumer, err := NewKafkaConsumer(config, processor)
 		if err != nil {
 			log.Printf("[WARN] Failed to create Kafka consumer: %v", err)
 		} else {
 			processor.kafkaConsumer = kafkaConsumer
+			log.Printf("[INFO] 🚀 Starting Kafka Consumer...")
 			processor.kafkaConsumer.Start()
 		}
 	}
@@ -91,6 +99,7 @@ func main() {
 				logStr += fmt.Sprintf(", Kafka Producer: sent=%d errors=%d", sent, errors)
 			}
 
+			// ========== 只获取 stats，不调用 Start() ==========
 			if processor.kafkaConsumer != nil && processor.kafkaConsumer.enabled {
 				received := processor.kafkaConsumer.GetStats()
 				logStr += fmt.Sprintf(", Kafka Consumer: received=%d", received)

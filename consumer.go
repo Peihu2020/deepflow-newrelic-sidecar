@@ -12,14 +12,16 @@ import (
 )
 
 type KafkaConsumer struct {
-	consumerGroup sarama.ConsumerGroup
-	topics        []string
-	ready         chan bool
-	enabled       bool
-	stopped       atomic.Bool
-	wg            sync.WaitGroup
-	processor     *Processor
-	receivedCount int64
+	consumerGroup  sarama.ConsumerGroup
+	topics         []string
+	ready          chan bool
+	enabled        bool
+	stopped        atomic.Bool
+	wg             sync.WaitGroup
+	processor      *Processor
+	receivedCount  int64
+	workerCount    int
+	messageChannel chan *sarama.ConsumerMessage
 }
 
 type ConsumerGroupHandler struct {
@@ -31,7 +33,6 @@ func NewKafkaConsumer(config *Config, processor *Processor) (*KafkaConsumer, err
 		return &KafkaConsumer{enabled: false}, nil
 	}
 
-	// 强制使用配置的 broker 地址
 	brokers := config.KafkaBrokers
 	log.Printf("[INFO] Connecting to Kafka brokers: %v", brokers)
 
@@ -43,7 +44,12 @@ func NewKafkaConsumer(config *Config, processor *Processor) (*KafkaConsumer, err
 		kafkaConfig.Consumer.Offsets.Initial = sarama.OffsetNewest
 	}
 
-	// 禁用 metadata 自动刷新，使用配置的地址
+	// 性能配置
+	kafkaConfig.Consumer.Fetch.Default = 1024 * 1024 * 5
+	kafkaConfig.Consumer.Fetch.Max = 1024 * 1024 * 20
+	kafkaConfig.Consumer.MaxWaitTime = 500 * time.Millisecond
+	kafkaConfig.Consumer.MaxProcessingTime = 60 * time.Second
+
 	kafkaConfig.Metadata.Full = false
 	kafkaConfig.Metadata.RefreshFrequency = 0
 	kafkaConfig.ClientID = "deepflow-sidecar-consumer"
@@ -54,15 +60,25 @@ func NewKafkaConsumer(config *Config, processor *Processor) (*KafkaConsumer, err
 		return &KafkaConsumer{enabled: false}, nil
 	}
 
-	log.Printf("[INFO] Kafka Consumer initialized: brokers=%v, group=%s, topics=%v",
-		brokers, config.KafkaConsumerGroup, config.KafkaConsumerTopics)
+	workerCount := config.WorkerCount
+	if workerCount < 4 {
+		workerCount = 4
+	}
+	if workerCount > 64 {
+		workerCount = 64
+	}
+
+	log.Printf("[INFO] Kafka Consumer initialized: brokers=%v, group=%s, topics=%v, workers=%d",
+		brokers, config.KafkaConsumerGroup, config.KafkaConsumerTopics, workerCount)
 
 	consumer := &KafkaConsumer{
-		consumerGroup: consumerGroup,
-		topics:        config.KafkaConsumerTopics,
-		ready:         make(chan bool),
-		enabled:       true,
-		processor:     processor,
+		consumerGroup:  consumerGroup,
+		topics:         config.KafkaConsumerTopics,
+		ready:          make(chan bool),
+		enabled:        true,
+		processor:      processor,
+		workerCount:    workerCount,
+		messageChannel: make(chan *sarama.ConsumerMessage, workerCount*10),
 	}
 
 	return consumer, nil
@@ -73,10 +89,16 @@ func (c *KafkaConsumer) Start() {
 		return
 	}
 
+	// 启动 worker 池
+	for i := 0; i < c.workerCount; i++ {
+		c.wg.Add(1)
+		go c.messageWorker(i)
+	}
+
+	// 启动 consumer group
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		ctx := context.Background()
 		handler := &ConsumerGroupHandler{consumer: c}
 
 		for {
@@ -84,9 +106,9 @@ func (c *KafkaConsumer) Start() {
 				return
 			}
 
-			if err := c.consumerGroup.Consume(ctx, c.topics, handler); err != nil {
+			if err := c.consumerGroup.Consume(context.Background(), c.topics, handler); err != nil {
 				if !c.stopped.Load() {
-					log.Printf("[WARN] Kafka consumer error: %v", err)
+					log.Printf("[ERROR] Kafka consumer error: %v", err)
 				}
 				time.Sleep(5 * time.Second)
 			}
@@ -97,17 +119,69 @@ func (c *KafkaConsumer) Start() {
 		}
 	}()
 
-	<-c.ready
-	log.Printf("[INFO] Kafka consumer ready, processing messages")
+	// 等待 consumer 就绪
+	select {
+	case <-c.ready:
+		log.Printf("[INFO] Kafka consumer ready, processing messages")
+	case <-time.After(30 * time.Second):
+		log.Printf("[ERROR] Timeout waiting for Kafka consumer to be ready!")
+	}
+}
+
+func (c *KafkaConsumer) messageWorker(workerID int) {
+	defer c.wg.Done()
+
+	for {
+		select {
+		case message, ok := <-c.messageChannel:
+			if !ok || c.stopped.Load() {
+				return
+			}
+			c.processMessage(message)
+		case <-time.After(10 * time.Second):
+			if c.stopped.Load() && len(c.messageChannel) == 0 {
+				return
+			}
+		}
+	}
+}
+
+func (c *KafkaConsumer) processMessage(message *sarama.ConsumerMessage) {
+	shouldProcess := false
+	parts := strings.SplitN(string(message.Value), "|", 2)
+	if len(parts) == 2 {
+		dataType := parts[0]
+		switch dataType {
+		case "l7":
+			shouldProcess = c.processor.config.EnableL7
+		case "l4":
+			shouldProcess = c.processor.config.EnableL4
+		case "metrics":
+			shouldProcess = c.processor.config.EnableMetrics
+		}
+	}
+
+	if shouldProcess {
+		atomic.AddInt64(&c.receivedCount, 1)
+		c.processor.ProcessKafkaMessage(message.Value)
+	}
 }
 
 func (c *KafkaConsumer) Stop() {
 	if !c.enabled {
 		return
 	}
+
 	c.stopped.Store(true)
-	c.consumerGroup.Close()
+	time.Sleep(2 * time.Second)
+	close(c.messageChannel)
+
+	if err := c.consumerGroup.Close(); err != nil {
+		log.Printf("[WARN] Error closing consumer group: %v", err)
+	}
+
 	c.wg.Wait()
+	log.Printf("[INFO] Kafka consumer stopped")
 }
 
 func (h *ConsumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error {
@@ -121,27 +195,11 @@ func (h *ConsumerGroupHandler) Cleanup(session sarama.ConsumerGroupSession) erro
 
 func (h *ConsumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	for message := range claim.Messages() {
-		// 根据配置决定是否处理
-		shouldProcess := false
-
-		parts := strings.SplitN(string(message.Value), "|", 2)
-		if len(parts) == 2 {
-			dataType := parts[0]
-			switch dataType {
-			case "l7":
-				shouldProcess = h.consumer.processor.config.EnableL7
-			case "l4":
-				shouldProcess = h.consumer.processor.config.EnableL4
-			case "metrics":
-				shouldProcess = h.consumer.processor.config.EnableMetrics
-			}
+		select {
+		case h.consumer.messageChannel <- message:
+		default:
+			h.consumer.processMessage(message)
 		}
-
-		if shouldProcess {
-			atomic.AddInt64(&h.consumer.receivedCount, 1)
-			h.consumer.processor.ProcessKafkaMessage(message.Value)
-		}
-		// 无论是否处理，都标记消息已消费
 		session.MarkMessage(message, "")
 	}
 	return nil

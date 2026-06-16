@@ -9,7 +9,7 @@ import (
 )
 
 type KafkaProducer struct {
-	producer   sarama.SyncProducer
+	producer   sarama.AsyncProducer
 	topic      string
 	enabled    bool
 	sentCount  int64
@@ -25,46 +25,77 @@ func NewKafkaProducer(config *Config) (*KafkaProducer, error) {
 	kafkaConfig := sarama.NewConfig()
 	kafkaConfig.Version = sarama.V2_6_0_0
 
-	// ========== 优化1：启用压缩（减少网络传输 70-80%）==========
-	kafkaConfig.Producer.Compression = sarama.CompressionSnappy // 或 GZIP
+	// ========== 压缩配置 ==========
+	kafkaConfig.Producer.Compression = sarama.CompressionSnappy
 
-	// ========== 优化2：降低确认级别（减少等待）==========
-	kafkaConfig.Producer.RequiredAcks = sarama.WaitForLocal // 只等待 leader 确认
-	// 如果数据非常重要，保持 WaitForAll，但配合压缩使用
+	// ========== 异步配置（关键）==========
+	kafkaConfig.Producer.RequiredAcks = sarama.WaitForLocal
+	kafkaConfig.Producer.Return.Successes = false // 不返回成功确认（异步）
+	kafkaConfig.Producer.Return.Errors = true     // 但要返回错误
 
-	// ========== 优化3：批量发送（减少网络往返）==========
+	// ========== 批量发送配置 ==========
 	kafkaConfig.Producer.Flush.Bytes = 1024 * 1024                // 1MB 批量
-	kafkaConfig.Producer.Flush.Messages = 200                     // 或 200 条消息
-	kafkaConfig.Producer.Flush.Frequency = 100 * time.Millisecond // 或 100ms
+	kafkaConfig.Producer.Flush.Messages = 200                     // 200条消息批量
+	kafkaConfig.Producer.Flush.Frequency = 100 * time.Millisecond // 100ms刷新
 
-	// ========== 优化4：异步发送（提高吞吐）==========
-	// 改为 AsyncProducer 会更好，但需要修改代码结构
-	// 保持 SyncProducer 的话，至少启用批量
-
+	// ========== 重试配置 ==========
 	kafkaConfig.Producer.Retry.Max = 3
-	kafkaConfig.Producer.Return.Successes = true
+	kafkaConfig.Producer.Retry.Backoff = 100 * time.Millisecond
+
+	// ========== 超时配置 ==========
 	kafkaConfig.Producer.Timeout = config.KafkaProducerTimeout
 
-	// 禁用 metadata 获取
+	// ========== 元数据配置 ==========
 	kafkaConfig.Metadata.Full = false
 	kafkaConfig.Metadata.RefreshFrequency = 0
 	kafkaConfig.ClientID = "deepflow-sidecar-producer"
 
-	producer, err := sarama.NewSyncProducer(config.KafkaBrokers, kafkaConfig)
+	// ========== 最大消息大小 ==========
+	kafkaConfig.Producer.MaxMessageBytes = 1024 * 1024 * 10 // 10MB
+
+	// 创建异步 Producer
+	producer, err := sarama.NewAsyncProducer(config.KafkaBrokers, kafkaConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	log.Printf("[INFO] Kafka Producer initialized: brokers=%v, topic=%s, compression=snappy",
-		config.KafkaBrokers, config.KafkaTopic)
-
-	return &KafkaProducer{
+	kp := &KafkaProducer{
 		producer: producer,
 		topic:    config.KafkaTopic,
 		enabled:  true,
-	}, nil
+	}
+
+	// 启动错误处理协程
+	go kp.handleErrors()
+
+	// 可选：启动成功确认协程（如果需要记录成功）
+	// go kp.handleSuccesses()
+
+	log.Printf("[INFO] Kafka AsyncProducer initialized: brokers=%v, topic=%s, compression=snappy",
+		config.KafkaBrokers, config.KafkaTopic)
+
+	return kp, nil
 }
 
+// 处理异步发送的错误
+func (kp *KafkaProducer) handleErrors() {
+	for err := range kp.producer.Errors() {
+		atomic.AddInt64(&kp.errorCount, 1)
+		if atomic.LoadInt64(&kp.errorCount)%100 == 1 {
+			log.Printf("[ERROR] Kafka producer error: %v (total errors: %d)",
+				err.Err, atomic.LoadInt64(&kp.errorCount))
+		}
+	}
+}
+
+// 可选：处理成功确认（用于统计）
+func (kp *KafkaProducer) handleSuccesses() {
+	for range kp.producer.Successes() {
+		atomic.AddInt64(&kp.sentCount, 1)
+	}
+}
+
+// 异步发送消息
 func (kp *KafkaProducer) Send(data []byte) error {
 	if !kp.enabled || kp.closed.Load() {
 		return nil
@@ -76,14 +107,16 @@ func (kp *KafkaProducer) Send(data []byte) error {
 		Timestamp: time.Now(),
 	}
 
-	_, _, err := kp.producer.SendMessage(msg)
-	if err != nil {
+	// 异步发送：将消息放入 channel，立即返回
+	select {
+	case kp.producer.Input() <- msg:
+		atomic.AddInt64(&kp.sentCount, 1)
+		return nil
+	default:
+		// 如果 channel 满了，记录错误
 		atomic.AddInt64(&kp.errorCount, 1)
-		return err
+		return nil
 	}
-
-	atomic.AddInt64(&kp.sentCount, 1)
-	return nil
 }
 
 func (kp *KafkaProducer) GetStats() (sent, errors int64) {

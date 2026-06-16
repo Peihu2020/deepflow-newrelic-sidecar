@@ -6,7 +6,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"strings"
 	"sync/atomic"
 )
 
@@ -44,7 +43,14 @@ func (p *Processor) buildHTTPHandler() http.Handler {
 	return mux
 }
 
+// handler.go
 func (p *Processor) handleDataAsync(w http.ResponseWriter, r *http.Request) {
+	// ========== Consumer-only 模式：拒绝 HTTP 请求 ==========
+	if p.config.ConsumerOnlyMode {
+		http.Error(w, "This instance only consumes from Kafka", http.StatusServiceUnavailable)
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -52,6 +58,10 @@ func (p *Processor) handleDataAsync(w http.ResponseWriter, r *http.Request) {
 
 	if !p.limiter.Allow() {
 		atomic.AddInt64(&p.droppedRequests, 1)
+		dropped := atomic.LoadInt64(&p.droppedRequests)
+		if dropped%1000 == 0 {
+			log.Printf("[WARN] Rate limit exceeded, rejected %d requests total", dropped)
+		}
 		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
@@ -63,35 +73,14 @@ func (p *Processor) handleDataAsync(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// ========== 根据配置决定是否写入 Kafka ==========
+	// 写入 Kafka（如果启用）
 	if p.kafkaProducer != nil && p.kafkaProducer.enabled {
-		// 检查数据类型，根据配置决定是否保存到 Kafka
-		shouldSaveToKafka := true
-
-		parts := strings.SplitN(string(body), "|", 2)
-		if len(parts) == 2 {
-			dataType := parts[0]
-			switch dataType {
-			case "l7":
-				shouldSaveToKafka = p.config.EnableL7
-			case "l4":
-				shouldSaveToKafka = p.config.EnableL4
-			case "metrics":
-				shouldSaveToKafka = p.config.EnableMetrics
-			default:
-				// 未知类型，根据配置决定
-				shouldSaveToKafka = p.config.EnableL7 || p.config.EnableL4 || p.config.EnableMetrics
-			}
-		}
-
-		if shouldSaveToKafka {
-			if err := p.kafkaProducer.Send(body); err != nil {
-				log.Printf("[WARN] Failed to send to Kafka: %v", err)
-			}
+		if err := p.kafkaProducer.Send(body); err != nil {
+			log.Printf("[WARN] Failed to send to Kafka: %v", err)
 		}
 	}
 
-	// 总是放入 workQueue 处理（实时发送到 New Relic）
+	// 直接处理（放入 workQueue）
 	select {
 	case p.workQueue <- body:
 		w.WriteHeader(http.StatusAccepted)

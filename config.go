@@ -8,44 +8,49 @@ import (
 )
 
 type Config struct {
-	// NewRelic config
-	NewRelicLicense   string
-	NewRelicAccountID string
-	NewRelicDebugMode bool
+	// HTTP 配置
+	HTTPPort             string        `env:"HTTP_PORT" default:"8080"`
+	HTTPReadTimeout      time.Duration `env:"HTTP_READ_TIMEOUT" default:"30s"`
+	HTTPWriteTimeout     time.Duration `env:"HTTP_WRITE_TIMEOUT" default:"30s"`
+	DeepFlowHTTPEndpoint string        `env:"DEEPFLOW_HTTP_ENDPOINT" default:"/api/deepflow-data"`
 
-	// Sidecar config
-	BatchSize        int
-	FlushInterval    time.Duration
-	LogLevel         string
-	HTTPPort         string
-	DebugDir         string
-	SaveDebugData    bool
-	MaxQueueSize     int
-	WorkerCount      int
-	RateLimitPerSec  int
-	RateLimitBurst   int
-	HTTPReadTimeout  time.Duration
-	HTTPWriteTimeout time.Duration
+	// 处理配置
+	BatchSize       int           `env:"BATCH_SIZE" default:"100"`
+	FlushInterval   time.Duration `env:"FLUSH_INTERVAL" default:"3s"`
+	WorkerCount     int           `env:"WORKER_COUNT" default:"4"`
+	MaxQueueSize    int           `env:"MAX_QUEUE_SIZE" default:"10000"`
+	RateLimitPerSec int           `env:"RATE_LIMIT_PER_SEC" default:"20000"`
+	RateLimitBurst  int           `env:"RATE_LIMIT_BURST" default:"50000"`
 
-	// Log type filters
-	EnableL7      bool
-	EnableL4      bool
-	EnableMetrics bool
+	// 日志类型
+	EnableL7      bool `env:"ENABLE_L7" default:"true"`
+	EnableL4      bool `env:"ENABLE_L4" default:"true"`
+	EnableMetrics bool `env:"ENABLE_METRICS" default:"false"`
 
-	// HTTP mode config
-	DeepFlowHTTPEndpoint string
+	// New Relic 配置
+	NewRelicLicense   string `env:"NEW_RELIC_LICENSE_KEY"`
+	NewRelicAccountID string `env:"NEW_RELIC_ACCOUNT_ID"`
+	NewRelicDebugMode bool   `env:"NEW_RELIC_DEBUG_MODE" default:"false"`
 
-	// Kafka Producer config
-	KafkaProducerEnabled bool
-	KafkaBrokers         []string
-	KafkaTopic           string
-	KafkaProducerTimeout time.Duration
+	// Kafka Producer 配置
+	KafkaProducerEnabled bool          `env:"KAFKA_PRODUCER_ENABLED" default:"false"`
+	KafkaBrokers         []string      `env:"KAFKA_BROKERS" default:"localhost:9092"`
+	KafkaTopic           string        `env:"KAFKA_TOPIC" default:"deepflow-logs"`
+	KafkaProducerTimeout time.Duration `env:"KAFKA_PRODUCER_TIMEOUT" default:"5s"`
 
-	// Kafka Consumer config
-	KafkaConsumerEnabled bool
-	KafkaConsumerGroup   string
-	KafkaConsumerTopics  []string
-	KafkaConsumerOffset  string
+	// Kafka Consumer 配置
+	KafkaConsumerEnabled bool     `env:"KAFKA_CONSUMER_ENABLED" default:"false"`
+	KafkaConsumerGroup   string   `env:"KAFKA_CONSUMER_GROUP" default:"deepflow-sidecar"`
+	KafkaConsumerTopics  []string `env:"KAFKA_CONSUMER_TOPICS" default:"deepflow-logs"`
+	KafkaConsumerOffset  string   `env:"KAFKA_CONSUMER_OFFSET" default:"oldest"`
+
+	// ========== 新增：Consumer Only 模式 ==========
+	ConsumerOnlyMode bool `env:"CONSUMER_ONLY_MODE" default:"false"`
+
+	// 调试配置
+	LogLevel      string `env:"LOG_LEVEL" default:"info"`
+	SaveDebugData bool   `env:"SAVE_DEBUG_DATA" default:"false"`
+	DebugDir      string `env:"DEBUG_DIR" default:"./debug"`
 }
 
 func LoadConfig() *Config {
@@ -84,6 +89,7 @@ func LoadConfig() *Config {
 		KafkaConsumerGroup:   getEnv("KAFKA_CONSUMER_GROUP", "deepflow-sidecar"),
 		KafkaConsumerTopics:  strings.Split(getEnv("KAFKA_CONSUMER_TOPICS", "deepflow-logs"), ","),
 		KafkaConsumerOffset:  getEnv("KAFKA_CONSUMER_OFFSET", "oldest"),
+		ConsumerOnlyMode:     getEnvBool("CONSUMER_ONLY_MODE", false),
 	}
 }
 
