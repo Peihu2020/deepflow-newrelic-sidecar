@@ -32,10 +32,10 @@ func (p *Processor) processL7Line(dataStr, hostname string) json.RawMessage {
 	}
 	item["ingest_timestamp"] = time.Now().UnixMilli()
 	if startTime, ok := item["start_time"].(float64); ok {
-		item["start_timestamp"] = startTime / 1000 // 微秒 → 毫秒
+		item["start_timestamp"] = int64(startTime / 1000)
 	}
 	if endTime, ok := item["end_time"].(float64); ok {
-		item["end_timestamp"] = endTime / 1000 // 微秒 → 毫秒
+		item["end_timestamp"] = int64(endTime / 1000)
 	}
 
 	if duration, ok := item["response_duration"].(float64); ok {
@@ -105,10 +105,10 @@ func (p *Processor) processL4Line(dataStr, hostname string) json.RawMessage {
 	}
 	item["ingest_timestamp"] = time.Now().UnixMilli()
 	if startTime, ok := item["start_time"].(float64); ok {
-		item["start_timestamp"] = startTime / 1000 // 微秒 → 毫秒
+		item["start_timestamp"] = int64(startTime / 1000)
 	}
 	if endTime, ok := item["end_time"].(float64); ok {
-		item["end_timestamp"] = endTime / 1000 // 微秒 → 毫秒
+		item["end_timestamp"] = int64(endTime / 1000)
 	}
 	jsonBytes, err := json.Marshal(item)
 	if err != nil {
