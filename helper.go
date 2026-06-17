@@ -27,7 +27,9 @@ func (p *Processor) processL7Line(dataStr, hostname string) json.RawMessage {
 	}
 
 	item["eventType"] = "DeepFlowL7Log"
-	item["hostname"] = hostname
+	if _, exists := item["hostname"]; !exists {
+		item["hostname"] = hostname
+	}
 	item["ingest_timestamp"] = time.Now().UnixMilli()
 
 	if duration, ok := item["response_duration"].(float64); ok {
@@ -92,7 +94,9 @@ func (p *Processor) processL4Line(dataStr, hostname string) json.RawMessage {
 	}
 
 	item["eventType"] = "DeepFlowL4Log"
-	item["hostname"] = hostname
+	if _, exists := item["hostname"]; !exists {
+		item["hostname"] = hostname
+	}
 	item["ingest_timestamp"] = time.Now().UnixMilli()
 
 	jsonBytes, err := json.Marshal(item)

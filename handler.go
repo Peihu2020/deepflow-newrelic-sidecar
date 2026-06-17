@@ -6,6 +6,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"sync/atomic"
 )
 
@@ -72,6 +74,14 @@ func (p *Processor) handleDataAsync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
+
+	// ========== 添加 hostname ==========
+	hostname, _ := os.Hostname()
+	// 如果 body 中还没有 hostname，则添加
+	if !strings.Contains(string(body), `"hostname":`) {
+		body = []byte(strings.ReplaceAll(string(body), "}", `,"hostname":"`+hostname+`"}`))
+	}
+	// ===================================
 
 	// 写入 Kafka（如果启用）
 	if p.kafkaProducer != nil && p.kafkaProducer.enabled {
