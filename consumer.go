@@ -196,10 +196,14 @@ func (c *KafkaConsumer) processProfilerMessage(data []byte) {
 	log.Printf("[INFO] Received %d profiler samples from %s",
 		len(payload.Samples), payload.AgentID)
 
-	// 发送到 NewRelic（如果有）
-	if c.processor != nil && c.processor.nrClient != nil {
-		c.processor.sendProfilerToNewRelic(&payload)
+	// ========== Print first sample with readable stack ==========
+	if len(payload.Samples) > 0 {
+		sample := payload.Samples[0]
+		log.Printf("[PROFILER] Sample: PID=%d Comm=%s CPU=%d Count=%d",
+			sample.PID, sample.Comm, sample.CPU, sample.Count)
+		log.Printf("[PROFILER]   Stack: %s", sample.StackDataString)
 	}
+	// =============================================================
 }
 
 func (c *KafkaConsumer) Stop() {
