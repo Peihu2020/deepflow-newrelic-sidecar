@@ -1,0 +1,191 @@
+# daemonset.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: deepflow-agent
+  namespace: css-infra
+  labels:
+    app: deepflow
+    component: agent
+spec:
+  selector:
+    matchLabels:
+      app: deepflow
+      component: agent
+  template:
+    metadata:
+      labels:
+        app: deepflow
+        component: agent
+    spec:
+      hostNetwork: false
+      
+      containers:
+      # DeepFlow Agent
+      - name: deepflow-agent
+        image: gzdctko-harbor.chowsangsang.com/css-infra/deepflow-agent-patch:v7.1.8
+        imagePullPolicy: Always
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        - name: cgroup
+          mountPath: /host/sys/fs/cgroup
+          readOnly: true
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1024Mi"
+            cpu: "1000m"
+        securityContext:
+          privileged: true
+        # TCP probe for agent
+        livenessProbe:
+          tcpSocket:
+            port: 39090
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          tcpSocket:
+            port: 39090
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+      
+      # NewRelic Sidecar Container
+      - name: deepflow-newrelic-sidecar
+        image: gzdctko-harbor.chowsangsang.com/css-infra/deepflow-newrelic-sidecar:1.2
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: sidecar-http
+        env:
+        - name: NEW_RELIC_ACCOUNT_ID
+          valueFrom:
+            secretKeyRef:
+              name: deepflow-secrets
+              key: NEW_RELIC_ACCOUNT_ID
+        - name: NEW_RELIC_LICENSE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: deepflow-secrets
+              key: NEW_RELIC_LICENSE_KEY
+        - name: NEW_RELIC_DEBUG_MODE
+          value: "false"
+        - name: HTTP_PORT
+          value: "8080"
+        - name: DEEPFLOW_HTTP_ENDPOINT
+          value: "/api/deepflow-data"
+        - name: SAVE_DEBUG_DATA
+          value: "false"
+        - name: BATCH_SIZE
+          value: "100"
+        - name: FLUSH_INTERVAL
+          value: "3s"
+        - name: WORKER_COUNT
+          value: "32"
+        - name: MAX_QUEUE_SIZE
+          value: "10000"
+        - name: RATE_LIMIT_PER_SEC
+          value: "20000"
+        - name: RATE_LIMIT_BURST
+          value: "50000"
+        - name: ENABLE_DYNAMIC_BATCHING
+          value: "true"
+        - name: MIN_BATCH_SIZE
+          value: "10"
+        - name: MAX_BATCH_SIZE
+          value: "5000"
+        - name: BATCH_ADJUSTMENT_STEP
+          value: "10"
+        - name: ERROR_THRESHOLD
+          value: "3"
+        - name: ADJUST_COOLDOWN
+          value: "30s"
+        - name: ENABLE_L7
+          value: "true"
+        - name: ENABLE_L4
+          value: "true"
+        - name: ENABLE_METRICS
+          value: "false"
+        - name: KAFKA_PRODUCER_ENABLED
+          value: "true"
+        - name: KAFKA_BROKERS
+          value: "10.8.152.58:9092"
+        - name: KAFKA_TOPIC
+          value: "deepflow-logs"
+        - name: KAFKA_PRODUCER_TIMEOUT
+          value: "5s"
+        - name: CONSUMER_ONLY_MODE
+          value: "false"
+        - name: KAFKA_CONSUMER_ENABLED
+          value: "false"
+        - name: KAFKA_CONSUMER_GROUP
+          value: "deepflow-sidecar"
+        - name: KAFKA_CONSUMER_TOPICS
+          value: "deepflow-logs"
+        - name: KAFKA_CONSUMER_OFFSET
+          value: "newest"
+        
+        volumeMounts:
+        - name: sidecar-data
+          mountPath: /app/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        # TCP probe for sidecar
+        livenessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+      
+      volumes:
+      - name: sidecar-data
+        emptyDir: {}
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: cgroup
+        hostPath:
+          path: /sys/fs/cgroup
+      
+      tolerations:
+      - operator: Exists

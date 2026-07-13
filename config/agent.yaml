@@ -1,50 +1,96 @@
 log-file: /var/log/deepflow-agent/deepflow-agent.log
 log-level: info
-global:
-  limits:
-    max_memory: 1024      # 1536 MiB = 1.5 GB ✅
-    max_millicpus: 1000   # 2000 millicpus = 2 cores ✅
 
+global:
+  circuit_breakers:
+    relative_sys_load:
+      trigger_threshold: 2.0
+      recovery_threshold: 1.5
+      metric: load1
+  limits:
+    max_memory: 1024
+    max_millicpus: 1000
   standalone_mode:
-    max_data_file_size: 10      # 10 MiB ✅
-    data_file_dir: /var/log/deepflow-agent/   # ✅
-static_config:
-  ebpf:
-    enabled: true
-    socket:
-      uprobe:
-        tls:
-          enabled: true
-        golang:
-          enabled: true
-    profile:
-      on_cpu:
-        disabled: true
-        sampling_frequency: 99
+    max_data_file_size: 10
+    data_file_dir: /var/log/deepflow-agent/
+
+# ============================================
+# NEW: CUSTOM FORWARDER - PROFILER DATA
+# ============================================
+custom_forward:
+  enabled: true
+  endpoint: "http://127.0.0.1:8080/api/profiler"   # Point to your sidecar
+  batch_size: 100
+  flush_interval_secs: 5
+
 inputs:
   proc:
     process_matcher:
-      # Match httpd processes
       - match_regex: ^httpd$
         match_type: process_name
         only_in_container: false
         enabled_features:
-          - ebpf.socket.uprobe.tls   # Enable TLS/HTTPS decryption
-          - proc.gprocess_info        # Enable process info sync
+          - ebpf.socket.uprobe.tls
+          - proc.gprocess_info
+      # ========== NEW: Profile deepflow processes ==========
+      # - match_regex: ^deepflow-
+      #   match_type: process_name
+      #   only_in_container: false
+      #   enabled_features:
+      #     - ebpf.profile.on_cpu
+      #     - proc.gprocess_info
+      # ========== NEW: Profile Java processes ==========
+      - match_regex: ^java
+        match_type: process_name
+        only_in_container: false
+        enabled_features:
+          - ebpf.profile.on_cpu
+          - proc.gprocess_info
+      # Disable everything else by using a rule that matches nothing
+      - match_regex: ^$
+        match_type: process_name
+        only_in_container: false
+        enabled_features: []
+      # ========== NEW: Profile C/C++ processes (optional - for testing) ==========
+      # - match_regex: .*
+      #   match_type: process_name
+      #   only_in_container: false
+      #   enabled_features:
+      #     - ebpf.profile.on_cpu
+      #     - proc.gprocess_info
+
   cbpf:
     af_packet:
-      interface_regex:  ^(eth.*|en.*|veth.*)$
+      interface_regex: ^(eth.*|en.*|veth.*)$
+
   ebpf:
     disabled: false
     profile:
       on_cpu:
+        disabled: false
+        sampling_frequency: 99
+        aggregate_by_cpu: false
+      off_cpu:
         disabled: true
+      memory:
+        disabled: true
+      unwinding:
+        dwarf_disabled: false
+        dwarf_regex: ".*"
+        dwarf_process_map_size: 1024
+        dwarf_shard_map_size: 128
+      languages:
+        python_disabled: true
+        php_disabled: true
+        nodejs_disabled: true
+        lua_disabled: true
     socket:
       uprobe:
         tls:
           enabled: true
       tunning:
         syscall_trace_id_disabled: false
+
 processors:
   request_log:
     timeouts:
@@ -53,38 +99,38 @@ processors:
       - protocol: HTTP
         timeout: 1800s
     tunning:
-      payload_truncation: 16384   # 从 1024 改为 16384 (16KB)
+      payload_truncation: 16384
     application_protocol_inference:
-        enabled_protocols:
-          - HTTP
-          - HTTP2
-          - TLS
-          - MySQL
-          - PostgreSQL
-          - Redis
-          - MongoDB
-          - Oracle
-          - Kafka
-          - Memcached
+      enabled_protocols:
+        - HTTP
+        - HTTP2
+        - TLS
+        - MySQL
+        - PostgreSQL
+        - Redis
+        - MongoDB
+        - Oracle
+        - Kafka
+        - Memcached
     tag_extraction:
       tracing_tag:
         multiple_trace_id_collection: true
         apm_trace_id:
-          - traceparent      # W3C Trace Context: 00-TRACEID-SPANID-01
-          - sw8              # SkyWalking v8: 1-TRACEID-SEGMENTID-3-PARENT_SERVICE-PARENT_INSTANCE-PARENT_ENDPOINT-IPPORT
-          - sw6              # SkyWalking v6: 1-TRACEID-SEGMENTID-3-5-2-IPPORT-ENTRYURI-PARENTURI
-          - sw3              # SkyWalking v3: SEGMENTID|SPANID|100|100|#IPPORT|#PARENT_ENDPOINT|#ENDPOINT|TRACEID|SAMPLING
-          - uber-trace-id    # Jaeger: TRACEID:SPANID:PARENTSPANID:FLAGS
-          - b3               # Zipkin B3: TRACEID-SPANID-1
-          - X-B3-TraceId     # Alternative B3 header format
-          - X-Request-Id     # Common request ID header
+          - traceparent
+          - sw8
+          - sw6
+          - sw3
+          - uber-trace-id
+          - b3
+          - X-B3-TraceId
+          - X-Request-Id
         apm_span_id:
-          - traceparent      # W3C format: 00-TRACEID-SPANID-01
-          - sw8              # SkyWalking v8 format
-          - sw6              # SkyWalking v6 format
-          - uber-trace-id    # Jaeger format
-          - b3               # Zipkin B3 format: TRACEID-SPANID-1
-          - X-B3-SpanId      # Alternative B3 header format
+          - traceparent
+          - sw8
+          - sw6
+          - uber-trace-id
+          - b3
+          - X-B3-SpanId
         http_real_client:
           - X-Forwarded-For
           - X-Real-IP

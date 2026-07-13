@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"strings"
 	"sync"
@@ -147,6 +148,22 @@ func (c *KafkaConsumer) messageWorker(workerID int) {
 }
 
 func (c *KafkaConsumer) processMessage(message *sarama.ConsumerMessage) {
+	// ========== 新增：检测 Profiler 数据 ==========
+	// 检查是否有 profiler 相关的 header
+	for _, header := range message.Headers {
+		if string(header.Key) == "type" && string(header.Value) == "profiler" {
+			c.processProfilerMessage(message.Value)
+			return
+		}
+	}
+
+	// 检查是否 JSON 格式的 profiler 数据
+	var profilerPayload ProfilerPayload
+	if err := json.Unmarshal(message.Value, &profilerPayload); err == nil && len(profilerPayload.Samples) > 0 {
+		c.processProfilerMessage(message.Value)
+		return
+	}
+	// ========== 新增结束 ==========
 	shouldProcess := false
 	parts := strings.SplitN(string(message.Value), "|", 2)
 	if len(parts) == 2 {
@@ -164,6 +181,24 @@ func (c *KafkaConsumer) processMessage(message *sarama.ConsumerMessage) {
 	if shouldProcess {
 		atomic.AddInt64(&c.receivedCount, 1)
 		c.processor.ProcessKafkaMessage(message.Value)
+	}
+}
+
+// ========== 新增：处理 Profiler 消息 ==========
+func (c *KafkaConsumer) processProfilerMessage(data []byte) {
+	var payload ProfilerPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		log.Printf("[ERROR] Failed to parse profiler data: %v", err)
+		return
+	}
+
+	atomic.AddInt64(&c.receivedCount, int64(len(payload.Samples)))
+	log.Printf("[INFO] Received %d profiler samples from %s",
+		len(payload.Samples), payload.AgentID)
+
+	// 发送到 NewRelic（如果有）
+	if c.processor != nil && c.processor.nrClient != nil {
+		c.processor.sendProfilerToNewRelic(&payload)
 	}
 }
 

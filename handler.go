@@ -37,10 +37,60 @@ func (p *Processor) StartHTTPServer() {
 func (p *Processor) buildHTTPHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(p.config.DeepFlowHTTPEndpoint, p.handleDataAsync)
+	mux.HandleFunc(p.config.ProfilerEndpoint, p.handleProfilerData)
 	mux.HandleFunc("/health", p.handleHealth)
 	mux.HandleFunc("/stats", p.handleStats)
 	mux.HandleFunc("/api/flush", p.handleFlush)
 	return mux
+}
+
+// handleProfilerData handles profiler data from DeepFlow agent
+func (p *Processor) handleProfilerData(w http.ResponseWriter, r *http.Request) {
+	// Consumer-only mode: reject HTTP requests
+	if p.config.ConsumerOnlyMode {
+		http.Error(w, "This instance only consumes from Kafka", http.StatusServiceUnavailable)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if !p.config.EnableProfiler {
+		http.Error(w, "Profiler disabled", http.StatusForbidden)
+		return
+	}
+
+	if !p.limiter.Allow() {
+		atomic.AddInt64(&p.droppedRequests, 1)
+		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
+	// Read body (50MB limit for profiler)
+	body, err := io.ReadAll(io.LimitReader(r.Body, 50*1024*1024))
+	if err != nil {
+		http.Error(w, "Failed to read body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	// Process profiler data
+	if err := p.processProfilerData(body); err != nil {
+		log.Printf("[ERROR] Failed to process profiler data: %v", err)
+		http.Error(w, "Failed to process data", http.StatusInternalServerError)
+		return
+	}
+
+	// Return success
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "accepted",
+		"type":   "profiler",
+		"size":   len(body),
+	})
 }
 
 // handler.go
@@ -94,13 +144,14 @@ func (p *Processor) handleDataAsync(w http.ResponseWriter, r *http.Request) {
 func (p *Processor) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	l7Sent, l7Dropped, l4Sent, l4Dropped, metricsSent, metricsDropped, queueLen := p.GetStats()
-
+	profilerSent, profilerSamples, profilerDropped := p.GetProfilerStats()
 	response := map[string]interface{}{
 		"status": "healthy",
 		"enabled_types": map[string]bool{
-			"l7":      p.config.EnableL7,
-			"l4":      p.config.EnableL4,
-			"metrics": p.config.EnableMetrics,
+			"l7":       p.config.EnableL7,
+			"l4":       p.config.EnableL4,
+			"metrics":  p.config.EnableMetrics,
+			"profiler": p.config.EnableProfiler, // NEW
 		},
 		"stats": map[string]interface{}{
 			"l7_sent":          l7Sent,
@@ -109,6 +160,9 @@ func (p *Processor) handleHealth(w http.ResponseWriter, r *http.Request) {
 			"l4_dropped":       l4Dropped,
 			"metrics_sent":     metricsSent,
 			"metrics_dropped":  metricsDropped,
+			"profiler_sent":    profilerSent,    // NEW
+			"profiler_samples": profilerSamples, // NEW
+			"profiler_dropped": profilerDropped, // NEW
 			"queue_length":     queueLen,
 			"requests_dropped": p.GetDroppedRequests(),
 		},

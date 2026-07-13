@@ -51,6 +51,11 @@ type Config struct {
 	LogLevel      string `env:"LOG_LEVEL" default:"info"`
 	SaveDebugData bool   `env:"SAVE_DEBUG_DATA" default:"false"`
 	DebugDir      string `env:"DEBUG_DIR" default:"./debug"`
+
+	// ========== 新增：Profiler 配置 ==========
+	EnableProfiler   bool   `env:"ENABLE_PROFILER" default:"true"`
+	ProfilerEndpoint string `env:"PROFILER_ENDPOINT" default:"/api/profiler"`
+	ProfilerTopic    string `env:"PROFILER_TOPIC" default:"deepflow-profiler"` // Kafka topic for profiler data
 }
 
 func LoadConfig() *Config {
@@ -90,6 +95,10 @@ func LoadConfig() *Config {
 		KafkaConsumerTopics:  strings.Split(getEnv("KAFKA_CONSUMER_TOPICS", "deepflow-logs"), ","),
 		KafkaConsumerOffset:  getEnv("KAFKA_CONSUMER_OFFSET", "oldest"),
 		ConsumerOnlyMode:     getEnvBool("CONSUMER_ONLY_MODE", false),
+
+		EnableProfiler:   getEnvBool("ENABLE_PROFILER", true),
+		ProfilerEndpoint: getEnv("PROFILER_ENDPOINT", "/api/profiler"),
+		ProfilerTopic:    getEnv("PROFILER_TOPIC", "deepflow-profiler"),
 	}
 }
 

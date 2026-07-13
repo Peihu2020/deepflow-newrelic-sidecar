@@ -1,0 +1,55 @@
+# sidecar-configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: deepflow-sidecar-config
+  namespace: css-infra
+data:
+  .env: |
+    # New Relic 配置
+    NEW_RELIC_ACCOUNT_ID=2270591
+    NEW_RELIC_LICENSE_KEY=aa34858ccc90b1145ecff70279c1db02FFFFNRAL
+    NEW_RELIC_DEBUG_MODE=false
+
+    # HTTP Server - Agent streams data here
+    HTTP_PORT=8080
+    DEEPFLOW_HTTP_ENDPOINT=/api/deepflow-data
+    SAVE_DEBUG_DATA=false
+
+    # ============================================
+    # Processing Configuration
+    # ============================================
+    BATCH_SIZE=100
+    FLUSH_INTERVAL=3s
+    WORKER_COUNT=32
+    MAX_QUEUE_SIZE=10000
+    RATE_LIMIT_PER_SEC=20000
+    RATE_LIMIT_BURST=50000
+
+    # ============================================
+    # Dynamic Batching Configuration
+    # ============================================
+    ENABLE_DYNAMIC_BATCHING=true
+    MIN_BATCH_SIZE=10
+    MAX_BATCH_SIZE=5000
+    BATCH_ADJUSTMENT_STEP=10
+    ERROR_THRESHOLD=3
+    ADJUST_COOLDOWN=30s
+
+    # Log Types
+    ENABLE_L7=true
+    ENABLE_L4=true
+    ENABLE_METRICS=false
+
+    # Kafka Producer
+    KAFKA_PRODUCER_ENABLED=true
+    KAFKA_BROKERS=10.8.152.58:9092
+    KAFKA_TOPIC=deepflow-logs
+    KAFKA_PRODUCER_TIMEOUT=5s
+
+    # Kafka Consumer
+    CONSUMER_ONLY_MODE=false
+    KAFKA_CONSUMER_ENABLED=false
+    KAFKA_CONSUMER_GROUP=deepflow-sidecar
+    KAFKA_CONSUMER_TOPICS=deepflow-logs
+    KAFKA_CONSUMER_OFFSET=newest

@@ -69,8 +69,8 @@ func NewKafkaProducer(config *Config) (*KafkaProducer, error) {
 	// 启动错误处理协程
 	go kp.handleErrors()
 
-	log.Printf("[INFO] Kafka AsyncProducer initialized: brokers=%v, topic=%s, compression=snappy",
-		config.KafkaBrokers, config.KafkaTopic)
+	log.Printf("[INFO] Kafka AsyncProducer initialized: brokers=%v, topics: l4/l7=%s, profiler=%s",
+		config.KafkaBrokers, config.KafkaTopic, config.ProfilerTopic)
 
 	return kp, nil
 }

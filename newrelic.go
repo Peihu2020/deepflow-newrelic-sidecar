@@ -92,3 +92,40 @@ func (c *NewRelicClient) SendLogs(logs []json.RawMessage) error {
 	body, _ := io.ReadAll(resp.Body)
 	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 }
+
+// SendEvent sends a single event to NewRelic Insights API
+func (c *NewRelicClient) SendEvent(event map[string]interface{}) error {
+	if c == nil {
+		return nil
+	}
+
+	// Wrap in array (NewRelic expects array of events)
+	events := []map[string]interface{}{event}
+
+	payload, err := json.Marshal(events)
+	if err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf("https://insights-collector.newrelic.com/v1/accounts/%s/events", c.accountID)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Insert-Key", c.license)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
+		return nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+}

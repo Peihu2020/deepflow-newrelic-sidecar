@@ -31,7 +31,8 @@ func main() {
 	}
 
 	log.Printf("Starting sidecar in HTTP mode")
-	log.Printf("Enabled types - L7: %v, L4: %v, Metrics: %v", config.EnableL7, config.EnableL4, config.EnableMetrics)
+	log.Printf("Enabled types - L7: %v, L4: %v, Metrics: %v, Profiler: %v",
+		config.EnableL7, config.EnableL4, config.EnableMetrics, config.EnableProfiler)
 	log.Printf("Workers: %d, Queue Size: %d, Rate Limit: %d/s", config.WorkerCount, config.MaxQueueSize, config.RateLimitPerSec)
 
 	if config.KafkaProducerEnabled {
