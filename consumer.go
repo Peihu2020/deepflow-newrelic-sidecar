@@ -224,7 +224,13 @@ func (c *KafkaConsumer) Stop() {
 }
 
 func (h *ConsumerGroupHandler) Setup(session sarama.ConsumerGroupSession) error {
-	close(h.consumer.ready)
+	// Prevent closing already closed channel
+	select {
+	case <-h.consumer.ready:
+		// Already closed, do nothing
+	default:
+		close(h.consumer.ready)
+	}
 	return nil
 }
 

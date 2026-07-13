@@ -26,12 +26,12 @@ custom_forward:
 inputs:
   proc:
     process_matcher:
-      - match_regex: ^httpd$
-        match_type: process_name
-        only_in_container: false
-        enabled_features:
-          - ebpf.socket.uprobe.tls
-          - proc.gprocess_info
+      # - match_regex: ^httpd$
+      #   match_type: process_name
+      #   only_in_container: false
+      #   enabled_features:
+      #     - ebpf.socket.uprobe.tls
+      #     - proc.gprocess_info
       # ========== NEW: Profile deepflow processes ==========
       # - match_regex: ^deepflow-
       #   match_type: process_name
@@ -47,9 +47,10 @@ inputs:
           - ebpf.profile.on_cpu
           - proc.gprocess_info
       # Disable everything else by using a rule that matches nothing
-      - match_regex: ^$
+      - match_regex: .*
         match_type: process_name
-        only_in_container: false
+        only_in_container: false   # ← CHANGE to false
+        ignore: true              # ← Drops ALL other processes
         enabled_features: []
       # ========== NEW: Profile C/C++ processes (optional - for testing) ==========
       # - match_regex: .*
