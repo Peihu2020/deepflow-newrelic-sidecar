@@ -176,9 +176,8 @@ func (p *Processor) sendProfilerToNewRelic(payload *ProfilerPayload) {
 			"profiler_trace":   sample.StackDataString,
 			"agent_id":         payload.AgentID,
 			"hostname":         payload.Hostname,
-			"timestamp":        sample.Timestamp,
+			"timestamp":        sample.Timestamp / 1000000,
 			"profiler_type":    sample.ProfilerType,
-			"is_profiler_data": true,
 		}
 
 		// Convert to JSON and append to logs
