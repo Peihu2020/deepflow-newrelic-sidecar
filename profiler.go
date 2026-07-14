@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -25,7 +26,7 @@ type StackTraceData struct {
 	ProfilerType    uint8  `json:"profiler_type"`
 	StackData       []byte `json:"stack_data"`
 	StackDataLen    uint32 `json:"stack_data_len"`
-	StackDataString string `json:"stack_data_string"`
+	StackDataString string `json:"stack_data_string"` // Decoded stack trace string
 }
 
 type ProfilerPayload struct {
@@ -35,6 +36,22 @@ type ProfilerPayload struct {
 	Samples   []StackTraceData `json:"samples"`
 }
 
+// decodeStackTrace decodes Base64 encoded stack trace if needed
+func decodeStackTrace(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+
+	// Try Base64 decode (DeepFlow sends stack_data as Base64)
+	decoded, err := base64.StdEncoding.DecodeString(string(data))
+	if err == nil {
+		return string(decoded)
+	}
+
+	// Not Base64, return as-is
+	return string(data)
+}
+
 // Process profiler data from HTTP
 func (p *Processor) processProfilerData(data []byte) error {
 	var payload ProfilerPayload
@@ -42,41 +59,59 @@ func (p *Processor) processProfilerData(data []byte) error {
 		return err
 	}
 
-	// ========== CONVERT stack_data to readable string ==========
-	for i := range payload.Samples {
-		payload.Samples[i].StackDataString = string(payload.Samples[i].StackData)
-	}
-	// =========================================================
+	// ===== DECODE STACK DATA & FILTER =====
+	var realSamples []StackTraceData
+	for _, sample := range payload.Samples {
+		// Decode stack trace
+		sample.StackDataString = decodeStackTrace(sample.StackData)
 
-	// Send to Kafka if enabled
+		// Only keep real processes (PID != 0)
+		if sample.PID != 0 {
+			realSamples = append(realSamples, sample)
+		}
+	}
+
+	// Skip if no real samples
+	if len(realSamples) == 0 {
+		return nil
+	}
+
+	// Create filtered payload with decoded stack data
+	filteredPayload := ProfilerPayload{
+		AgentID:   payload.AgentID,
+		Hostname:  payload.Hostname,
+		Timestamp: payload.Timestamp,
+		Samples:   realSamples,
+	}
+	// =============================================
+
+	// Send filtered data to Kafka
 	if p.kafkaProducer != nil && p.kafkaProducer.enabled {
 		topic := p.config.ProfilerTopic
 		if topic == "" {
 			topic = "deepflow-profiler"
 		}
 
-		// Re-marshal with converted data
-		newData, err := json.Marshal(payload)
+		filteredData, err := json.Marshal(filteredPayload)
 		if err != nil {
 			return err
 		}
 
 		msg := &sarama.ProducerMessage{
 			Topic:     topic,
-			Value:     sarama.ByteEncoder(newData),
+			Value:     sarama.ByteEncoder(filteredData),
 			Timestamp: time.Now(),
 			Headers: []sarama.RecordHeader{
 				{Key: []byte("type"), Value: []byte("profiler")},
 				{Key: []byte("agent_id"), Value: []byte(payload.AgentID)},
 				{Key: []byte("hostname"), Value: []byte(payload.Hostname)},
-				{Key: []byte("samples"), Value: []byte(fmt.Sprintf("%d", len(payload.Samples)))},
+				{Key: []byte("samples"), Value: []byte(fmt.Sprintf("%d", len(realSamples)))},
 			},
 		}
 
 		p.kafkaProducer.producer.Input() <- msg
-
 		atomic.AddInt64(&p.profilerSent, 1)
-		atomic.AddInt64(&p.profilerSamples, int64(len(payload.Samples)))
+		atomic.AddInt64(&p.profilerSamples, int64(len(realSamples)))
 	}
 
 	return nil
