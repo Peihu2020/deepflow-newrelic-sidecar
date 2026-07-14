@@ -154,28 +154,47 @@ func (p *Processor) sendProfilerToNewRelic(payload *ProfilerPayload) {
 		return
 	}
 
-	// Add to batch sender (no limit - BatchSender handles batching)
-	for _, sample := range payload.Samples {
+	maxSamples := 100
+	samples := payload.Samples
+	if len(samples) > maxSamples {
+		samples = samples[:maxSamples]
+	}
+
+	// Use DeepFlowL7Log (known working event type)
+	eventType := p.config.ProfileEventType
+
+	var logs []json.RawMessage
+	for _, sample := range samples {
 		event := map[string]interface{}{
-			"eventType":     "DeepFlowProfiler",
-			"agent_id":      payload.AgentID,
-			"hostname":      payload.Hostname,
-			"pid":           sample.PID,
-			"tid":           sample.TID,
-			"cpu":           sample.CPU,
-			"count":         sample.Count,
-			"comm":          sample.Comm,
-			"process_name":  sample.ProcessName,
-			"timestamp":     sample.Timestamp,
-			"profiler_type": sample.ProfilerType,
-			"u_stack_id":    sample.UStackID,
-			"k_stack_id":    sample.KStackID,
+			"eventType":        eventType,
+			"profiler_pid":     sample.PID,
+			"profiler_tid":     sample.TID,
+			"profiler_cpu":     sample.CPU,
+			"profiler_count":   sample.Count,
+			"profiler_comm":    sample.Comm,
+			"profiler_process": sample.ProcessName,
+			"profiler_trace":   sample.StackDataString,
+			"agent_id":         payload.AgentID,
+			"hostname":         payload.Hostname,
+			"timestamp":        sample.Timestamp,
+			"profiler_type":    sample.ProfilerType,
+			"is_profiler_data": true,
 		}
 
-		// Convert to JSON and add to batch sender
-		if jsonBytes, err := json.Marshal(event); err == nil {
-			p.profilerSender.Add(jsonBytes)
-			atomic.AddInt64(&p.profilerSamples, 1)
+		// Convert to JSON and append to logs
+		jsonBytes, err := json.Marshal(event)
+		if err != nil {
+			continue
+		}
+		logs = append(logs, json.RawMessage(jsonBytes))
+	}
+
+	if len(logs) > 0 {
+		log.Printf("[PROFILER] Sending %d profiler events as %s", len(logs), eventType)
+		if err := p.nrClient.SendLogs(logs); err != nil {
+			log.Printf("[ERROR] Failed to send profiler events to NewRelic: %v", err)
+		} else {
+			log.Printf("[PROFILER] Successfully sent %d profiler events as %s", len(logs), eventType)
 		}
 	}
 }

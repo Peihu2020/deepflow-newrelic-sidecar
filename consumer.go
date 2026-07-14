@@ -196,14 +196,18 @@ func (c *KafkaConsumer) processProfilerMessage(data []byte) {
 	log.Printf("[INFO] Received %d profiler samples from %s",
 		len(payload.Samples), payload.AgentID)
 
-	// ========== Print first sample with readable stack ==========
-	if len(payload.Samples) > 0 {
-		sample := payload.Samples[0]
-		log.Printf("[PROFILER] Sample: PID=%d Comm=%s CPU=%d Count=%d",
-			sample.PID, sample.Comm, sample.CPU, sample.Count)
-		log.Printf("[PROFILER]   Stack: %s", sample.StackDataString)
+	// Safe debug: Check if NewRelic client exists
+	if c.processor != nil && c.processor.nrClient != nil {
+		// Check if credentials exist (without printing them)
+		if c.processor.nrClient.license != "" && c.processor.nrClient.accountID != "" {
+			log.Printf("[DEBUG] NewRelic client ready (credentials present)")
+			c.processor.sendProfilerToNewRelic(&payload)
+		} else {
+			log.Printf("[WARN] NewRelic client exists but credentials are empty")
+		}
+	} else {
+		log.Printf("[WARN] NewRelic client is nil")
 	}
-	// =============================================================
 }
 
 func (c *KafkaConsumer) Stop() {

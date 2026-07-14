@@ -56,6 +56,7 @@ type Config struct {
 	EnableProfiler   bool   `env:"ENABLE_PROFILER" default:"true"`
 	ProfilerEndpoint string `env:"PROFILER_ENDPOINT" default:"/api/profiler"`
 	ProfilerTopic    string `env:"PROFILER_TOPIC" default:"deepflow-profiler"` // Kafka topic for profiler data
+	ProfileEventType string `env:"PROFILE_EVENT_TYPE" default:"DeepFlowProfiler"`
 }
 
 func LoadConfig() *Config {
@@ -99,6 +100,7 @@ func LoadConfig() *Config {
 		EnableProfiler:   getEnvBool("ENABLE_PROFILER", true),
 		ProfilerEndpoint: getEnv("PROFILER_ENDPOINT", "/api/profiler"),
 		ProfilerTopic:    getEnv("PROFILER_TOPIC", "deepflow-profiler"),
+		ProfileEventType: getEnv("PROFILE_EVENT_TYPE", "DeepFlowProfiler"),
 	}
 }
 

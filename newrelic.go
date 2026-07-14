@@ -129,3 +129,63 @@ func (c *NewRelicClient) SendEvent(event map[string]interface{}) error {
 	body, _ := io.ReadAll(resp.Body)
 	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 }
+
+// SendEventBatch sends multiple events in one API call
+func (c *NewRelicClient) SendEventBatch(events []map[string]interface{}) error {
+	if c == nil || len(events) == 0 {
+		return nil
+	}
+
+	if c.license == "" || c.accountID == "" {
+		log.Printf("[ERROR] NewRelic credentials missing")
+		return fmt.Errorf("NewRelic credentials missing")
+	}
+
+	// ===== PRINT EVENT NAME =====
+	if len(events) > 0 {
+		eventType, ok := events[0]["eventType"]
+		if ok {
+			log.Printf("[DEBUG] Event name being sent: %s", eventType)
+		} else {
+			log.Printf("[WARN] No eventType field found in events")
+		}
+	}
+	// ============================
+
+	payload, err := json.Marshal(events)
+	if err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf("https://insights-collector.newrelic.com/v1/accounts/%s/events", c.accountID)
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Insert-Key", c.license)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		log.Printf("[ERROR] NewRelic API request failed: %v", err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	// ===== PRINT RESPONSE BODY =====
+	body, _ := io.ReadAll(resp.Body)
+	log.Printf("[DEBUG] NewRelic response status: %d", resp.StatusCode)
+	if len(body) > 0 {
+		log.Printf("[DEBUG] NewRelic response body: %s", string(body))
+	}
+	// =============================
+
+	if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
+		log.Printf("[INFO] ✅ NewRelic events sent successfully: %d events", len(events))
+		return nil
+	}
+
+	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+}

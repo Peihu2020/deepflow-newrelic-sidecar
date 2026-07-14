@@ -151,6 +151,8 @@ processors:
           - field_name: "x-request-id"
 
 outputs:
+  flow_metrics:
+    enabled: false  # ← Disable metrics output
   flow_log:
     throttles:
       l4_throttle: 10000
