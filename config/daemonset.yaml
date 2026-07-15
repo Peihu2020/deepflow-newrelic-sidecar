@@ -1,4 +1,3 @@
-# daemonset.yaml
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -18,12 +17,14 @@ spec:
         app: deepflow
         component: agent
     spec:
-      hostNetwork: false
+      # 必须启用hostNetwork让agent能够通过localhost访问sidecar
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       
       containers:
       # DeepFlow Agent
       - name: deepflow-agent
-        image: gzdctko-harbor.chowsangsang.com/css-infra/deepflow-agent-patch:v7.1.8
+        image: gzdctko-harbor.chowsangsang.com/css-infra/deepflow-agent-patch:v7.1.8.1
         imagePullPolicy: Always
         env:
         - name: POD_NAME
@@ -38,7 +39,12 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: spec.nodeName
+        
         volumeMounts:
+        # 重要：挂载debugfs使eBPF正常工作
+        - name: debug
+          mountPath: /sys/kernel/debug
+          readOnly: true
         - name: proc
           mountPath: /host/proc
           readOnly: true
@@ -48,6 +54,7 @@ spec:
         - name: cgroup
           mountPath: /host/sys/fs/cgroup
           readOnly: true
+        
         resources:
           requests:
             memory: "512Mi"
@@ -55,9 +62,19 @@ spec:
           limits:
             memory: "1024Mi"
             cpu: "1000m"
+        
         securityContext:
           privileged: true
-        # TCP probe for agent
+          capabilities:
+            add:
+            - SYS_ADMIN
+            - SYS_RESOURCE
+            - SYS_PTRACE
+            - NET_ADMIN
+            - NET_RAW
+            - IPC_LOCK
+        
+        # Agent在39090端口提供健康检查
         livenessProbe:
           tcpSocket:
             port: 39090
@@ -73,7 +90,7 @@ spec:
           timeoutSeconds: 3
           failureThreshold: 3
       
-      # NewRelic Sidecar Container
+      # NewRelic Sidecar - 接收agent数据
       - name: deepflow-newrelic-sidecar
         image: gzdctko-harbor.chowsangsang.com/css-infra/deepflow-newrelic-sidecar:1.3
         imagePullPolicy: Always
@@ -84,6 +101,7 @@ spec:
         volumeMounts:
         - name: sidecar-data
           mountPath: /app/data
+        
         resources:
           requests:
             memory: "256Mi"
@@ -91,7 +109,8 @@ spec:
           limits:
             memory: "512Mi"
             cpu: "500m"
-        # TCP probe for sidecar
+        
+        # Sidecar在8080端口提供健康检查
         livenessProbe:
           tcpSocket:
             port: 8080
@@ -99,6 +118,7 @@ spec:
           periodSeconds: 30
           timeoutSeconds: 5
           failureThreshold: 3
+        
         readinessProbe:
           tcpSocket:
             port: 8080
@@ -110,15 +130,22 @@ spec:
       volumes:
       - name: sidecar-data
         emptyDir: {}
+      - name: debug
+        hostPath:
+          path: /sys/kernel/debug
+          type: DirectoryOrCreate
       - name: proc
         hostPath:
           path: /proc
+          type: Directory
       - name: sys
         hostPath:
           path: /sys
+          type: Directory
       - name: cgroup
         hostPath:
           path: /sys/fs/cgroup
+          type: Directory
       
       tolerations:
       - operator: Exists
