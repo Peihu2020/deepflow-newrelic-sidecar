@@ -146,3 +146,12 @@ outputs:
     timeout_seconds: 30
     batch_size: 100
     queue_size: 20000
+    exclude_traffic:
+      - ip_src: "127.0.0.1"
+        port_dst: 9092
+      - ip_src: "127.0.0.1"
+        port_dst: 8080
+      - ip_dst: "10.8.152.58"
+        port_dst: 9092
+      - ip_dst: "10.8.152.29"
+        port_dst: 9092
