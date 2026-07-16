@@ -29,12 +29,19 @@ custom_forward:
 
 inputs:
   proc:
+    proc_dir_path: /host/proc
+    enabled: true
     process_matcher:
+      - match_regex: .*java.*
+        match_type: cmdline
+        only_in_container: true
+        rewrite_name: java
+        enabled_features: [ebpf.profile.on_cpu, ebpf.socket.uprobe.tls, proc.gprocess_info]
       - match_regex: .*
         match_type: process_name
         only_in_container: false
         enabled_features:
-          - ebpf.profile.on_cpu
+          # - ebpf.profile.on_cpu
           - ebpf.socket.uprobe.tls
           - proc.gprocess_info
 

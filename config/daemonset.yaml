@@ -17,7 +17,7 @@ spec:
         app: deepflow
         component: agent
     spec:
-      # 必须启用hostNetwork让agent能够通过localhost访问sidecar
+      hostPID: true
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       
