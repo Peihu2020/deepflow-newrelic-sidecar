@@ -113,7 +113,7 @@ spec:
             memory: "512Mi"
             cpu: "200m"
           limits:
-            memory: "1024Mi"
+            memory: "1.5Gi"
             cpu: "500m"
         
         # Sidecar在8080端口提供健康检查
@@ -157,6 +157,3 @@ spec:
         configMap:
           name: deepflow-agent-config
           defaultMode: 0644
-      
-      tolerations:
-      - operator: Exists
