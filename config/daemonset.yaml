@@ -24,7 +24,7 @@ spec:
       containers:
       # DeepFlow Agent
       - name: deepflow-agent
-        image: gzdctko-harbor.chowsangsang.com/css-infra/deepflow-agent-patch:v7.1.8.1
+        image: gzdctko-harbor.chowsangsang.com/css-infra/deepflow-agent-patch:v7.1.8.5
         imagePullPolicy: Always
         env:
         - name: POD_NAME
@@ -54,6 +54,11 @@ spec:
         - name: cgroup
           mountPath: /host/sys/fs/cgroup
           readOnly: true
+        # ========== NEW: Mount agent config from ConfigMap ==========
+        - name: agent-config
+          mountPath: /app/agent.yaml
+          subPath: agent.yaml
+          readOnly: true
         
         resources:
           requests:
@@ -73,6 +78,7 @@ spec:
             - NET_ADMIN
             - NET_RAW
             - IPC_LOCK
+            - SYSLOG  # 🔥 新增：允许读取 /proc/kallsyms，解决 ON-CPU 权限问题
         
         # Agent在39090端口提供健康检查
         livenessProbe:
@@ -104,10 +110,10 @@ spec:
         
         resources:
           requests:
-            memory: "256Mi"
+            memory: "512Mi"
             cpu: "200m"
           limits:
-            memory: "512Mi"
+            memory: "1024Mi"
             cpu: "500m"
         
         # Sidecar在8080端口提供健康检查
@@ -146,6 +152,11 @@ spec:
         hostPath:
           path: /sys/fs/cgroup
           type: Directory
+      # ========== NEW: ConfigMap volume for agent.yaml ==========
+      - name: agent-config
+        configMap:
+          name: deepflow-agent-config
+          defaultMode: 0644
       
       tolerations:
       - operator: Exists

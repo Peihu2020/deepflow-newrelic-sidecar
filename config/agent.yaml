@@ -2,11 +2,6 @@ log-file: /var/log/deepflow-agent/deepflow-agent.log
 log-level: info
 
 global:
-  circuit_breakers:
-    relative_sys_load:
-      trigger_threshold: 2.0
-      recovery_threshold: 1.5
-      metric: load1
   limits:
     max_memory: 1024
     max_millicpus: 1000
@@ -14,51 +9,34 @@ global:
     max_data_file_size: 10
     data_file_dir: /var/log/deepflow-agent/
 
-# ============================================
-# NEW: CUSTOM FORWARDER - PROFILER DATA
-# ============================================
+l7-protocol-enabled:
+  - HTTP
+  - HTTP2
+  - TLS
+  - MySQL
+  - PostgreSQL
+  - Redis
+  - MongoDB
+  - Oracle
+  - Kafka
+  - Memcached
+
 custom_forward:
   enabled: true
-  endpoint: "http://127.0.0.1:8080/api/profiler"   # Point to your sidecar
+  endpoint: "http://127.0.0.1:8080/api/profiler"
   batch_size: 100
   flush_interval_secs: 5
 
 inputs:
   proc:
     process_matcher:
-      # - match_regex: ^httpd$
-      #   match_type: process_name
-      #   only_in_container: false
-      #   enabled_features:
-      #     - ebpf.socket.uprobe.tls
-      #     - proc.gprocess_info
-      # ========== NEW: Profile deepflow processes ==========
-      # - match_regex: ^deepflow-
-      #   match_type: process_name
-      #   only_in_container: false
-      #   enabled_features:
-      #     - ebpf.profile.on_cpu
-      #     - proc.gprocess_info
-      # ========== NEW: Profile Java processes ==========
-      - match_regex: ^java
+      - match_regex: .*
         match_type: process_name
         only_in_container: false
         enabled_features:
           - ebpf.profile.on_cpu
+          - ebpf.socket.uprobe.tls
           - proc.gprocess_info
-      # Disable everything else by using a rule that matches nothing
-      - match_regex: .*
-        match_type: process_name
-        only_in_container: false   # ← CHANGE to false
-        ignore: true              # ← Drops ALL other processes
-        enabled_features: []
-      # ========== NEW: Profile C/C++ processes (optional - for testing) ==========
-      # - match_regex: .*
-      #   match_type: process_name
-      #   only_in_container: false
-      #   enabled_features:
-      #     - ebpf.profile.on_cpu
-      #     - proc.gprocess_info
 
   cbpf:
     af_packet:
@@ -151,8 +129,6 @@ processors:
           - field_name: "x-request-id"
 
 outputs:
-  flow_metrics:
-    enabled: false  # ← Disable metrics output
   flow_log:
     throttles:
       l4_throttle: 10000
