@@ -39,12 +39,12 @@ func NewKafkaProducer(config *Config) (*KafkaProducer, error) {
 	kafkaConfig.Producer.Flush.Messages = 200                     // 200条消息批量
 	kafkaConfig.Producer.Flush.Frequency = 100 * time.Millisecond // 100ms刷新
 
-	// ========== 重试配置 ==========
-	kafkaConfig.Producer.Retry.Max = 3
-	kafkaConfig.Producer.Retry.Backoff = 100 * time.Millisecond
+	// ========== 🔥 重试配置（硬编码 - 增加重试次数和间隔）==========
+	kafkaConfig.Producer.Retry.Max = 10                          // 从 3 改为 10
+	kafkaConfig.Producer.Retry.Backoff = 1000 * time.Millisecond // 从 100ms 改为 1000ms (1秒)
 
-	// ========== 超时配置 ==========
-	kafkaConfig.Producer.Timeout = config.KafkaProducerTimeout
+	// ========== 🔥 超时配置（硬编码 - 增加超时时间）==========
+	kafkaConfig.Producer.Timeout = 60 * time.Second // 从默认 30s 改为 60s
 
 	// ========== 元数据配置 ==========
 	kafkaConfig.Metadata.Full = false
@@ -71,6 +71,7 @@ func NewKafkaProducer(config *Config) (*KafkaProducer, error) {
 
 	log.Printf("[INFO] Kafka AsyncProducer initialized: brokers=%v, topics: l4/l7=%s, profiler=%s",
 		config.KafkaBrokers, config.KafkaTopic, config.ProfilerTopic)
+	log.Printf("[INFO] Kafka config: Retry.Max=10, Retry.Backoff=1s, Timeout=60s")
 
 	return kp, nil
 }
@@ -152,7 +153,6 @@ func (kp *KafkaProducer) Send(data []byte) error {
 		Timestamp: time.Now(),
 	}
 
-	// ========== 移除 default，阻塞等待 ==========
 	kp.producer.Input() <- msg
 	return nil
 }
