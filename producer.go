@@ -40,11 +40,11 @@ func NewKafkaProducer(config *Config) (*KafkaProducer, error) {
 	kafkaConfig.Producer.Flush.Frequency = 100 * time.Millisecond // 100ms刷新
 
 	// ========== 🔥 重试配置（硬编码 - 增加重试次数和间隔）==========
-	kafkaConfig.Producer.Retry.Max = 10                          // 从 3 改为 10
-	kafkaConfig.Producer.Retry.Backoff = 1000 * time.Millisecond // 从 100ms 改为 1000ms (1秒)
+	kafkaConfig.Producer.Retry.Max = 3                          // 从 3 改为 10
+	kafkaConfig.Producer.Retry.Backoff = 100 * time.Millisecond // 从 100ms 改为 1000ms (1秒)
 
 	// ========== 🔥 超时配置（硬编码 - 增加超时时间）==========
-	kafkaConfig.Producer.Timeout = 60 * time.Second // 从默认 30s 改为 60s
+	kafkaConfig.Producer.Timeout = 10 * time.Second // 从默认 30s 改为 60s
 
 	// ========== 元数据配置 ==========
 	kafkaConfig.Metadata.Full = false
@@ -52,7 +52,7 @@ func NewKafkaProducer(config *Config) (*KafkaProducer, error) {
 	kafkaConfig.ClientID = "deepflow-sidecar-producer"
 
 	// ========== 最大消息大小 ==========
-	kafkaConfig.Producer.MaxMessageBytes = 1024 * 1024 * 10 // 10MB
+	kafkaConfig.Producer.MaxMessageBytes = 1024 * 1024 * 2 // 10MB
 
 	// 创建异步 Producer
 	producer, err := sarama.NewAsyncProducer(config.KafkaBrokers, kafkaConfig)

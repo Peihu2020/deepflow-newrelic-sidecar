@@ -6,7 +6,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"runtime"
 	"sync/atomic"
+	"time"
 )
 
 func (p *Processor) StartHTTPServer() {
@@ -95,6 +97,12 @@ func (p *Processor) handleProfilerData(w http.ResponseWriter, r *http.Request) {
 
 // handler.go
 func (p *Processor) handleDataAsync(w http.ResponseWriter, r *http.Request) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	if m.Alloc > 1000*1024*1024 { // 1000MB limit
+		http.Error(w, "Memory pressure", http.StatusServiceUnavailable)
+		return
+	}
 	// ========== Consumer-only 模式：拒绝 HTTP 请求 ==========
 	if p.config.ConsumerOnlyMode {
 		http.Error(w, "This instance only consumes from Kafka", http.StatusServiceUnavailable)
@@ -135,7 +143,7 @@ func (p *Processor) handleDataAsync(w http.ResponseWriter, r *http.Request) {
 	case p.workQueue <- body:
 		w.WriteHeader(http.StatusAccepted)
 		w.Write([]byte(`{"status":"accepted"}`))
-	default:
+	case <-time.After(50 * time.Millisecond): // ← Add timeout
 		atomic.AddInt64(&p.droppedRequests, 1)
 		http.Error(w, "Queue full", http.StatusServiceUnavailable)
 	}

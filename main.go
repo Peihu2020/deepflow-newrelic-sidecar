@@ -13,6 +13,24 @@ import (
 	"github.com/joho/godotenv"
 )
 
+func startMemoryMonitor(p *Processor) {
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		for range ticker.C {
+			var m runtime.MemStats
+			runtime.ReadMemStats(&m)
+
+			if m.Alloc > 1000*1024*1024 {
+				log.Printf("[WARN] Memory: %d MB, forcing GC", m.Alloc/1024/1024)
+				runtime.GC()
+				p.l7Sender.flush()
+				p.l4Sender.flush()
+				p.metricsSender.flush()
+			}
+		}
+	}()
+}
+
 func main() {
 	godotenv.Load()
 	config := LoadConfig()
@@ -45,6 +63,8 @@ func main() {
 	nrClient := NewNewRelicClient(config.NewRelicLicense, config.NewRelicAccountID, config.NewRelicDebugMode)
 
 	processor := NewProcessor(config, nrClient)
+
+	startMemoryMonitor(processor)
 
 	// ========== 初始化 Kafka Producer（独立） ==========
 	if config.KafkaProducerEnabled {
