@@ -155,3 +155,4 @@ outputs:
         port_dst: 9092
       - ip_dst: "10.8.152.29"
         port_dst: 9092
+      - domain: "insights-collector.newrelic.com"
