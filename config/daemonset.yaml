@@ -100,6 +100,15 @@ spec:
       - name: deepflow-newrelic-sidecar
         image: gzdctko-harbor.chowsangsang.com/css-infra/deepflow-newrelic-sidecar:1.5
         imagePullPolicy: Always
+        env:
+        - name: ENABLE_L7
+          value: "true"
+        - name: ENABLE_L4
+          value: "true"
+        - name: ENABLE_METRICS
+          value: "false"
+        - name: ENABLE_PROFILER
+          value: "true"
         ports:
         - containerPort: 8080
           name: sidecar-http
