@@ -27,11 +27,19 @@ jobs:
       - name: Build and publish container image to Private ACR
         env:
           ACR_NAME: pocgithubacr
+          ACR_LOGIN_SERVER: pocgithubacr.azurecr.io
           IMAGE_NAME: deepflow-newrelic-sidecar
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          az acr build \
-            --registry "$ACR_NAME" \
-            --image "${IMAGE_NAME}:${IMAGE_TAG}" \
-            --image "${IMAGE_NAME}:latest" \
-            .
+          az acr login --name "$ACR_NAME"
+
+          mkdir -p /kaniko/.docker
+          if [ -f "${HOME}/.docker/config.json" ]; then
+            cp "${HOME}/.docker/config.json" /kaniko/.docker/config.json
+          fi
+
+          /kaniko/executor \
+            --context "${GITHUB_WORKSPACE}" \
+            --dockerfile "${GITHUB_WORKSPACE}/Dockerfile" \
+            --destination "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${IMAGE_TAG}" \
+            --destination "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:latest"
