@@ -31,15 +31,28 @@ jobs:
           IMAGE_NAME: deepflow-newrelic-sidecar
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          az acr login --name "$ACR_NAME"
-
-          mkdir -p /kaniko/.docker
-          if [ -f "${HOME}/.docker/config.json" ]; then
-            cp "${HOME}/.docker/config.json" /kaniko/.docker/config.json
+          TOKEN=$(az acr login --name "$ACR_NAME" --expose-token --query accessToken --output tsv)
+          if [ -z "$TOKEN" ]; then
+            echo "Failed to acquire ACR access token"
+            exit 1
           fi
+
+          AUTH_B64=$(printf "00000000-0000-0000-0000-000000000000:%s" "$TOKEN" | base64 | tr -d '\n')
+          mkdir -p /kaniko/.docker
+          cat <<EOF > /kaniko/.docker/config.json
+          {
+            "auths": {
+              "${ACR_LOGIN_SERVER}": {
+                "auth": "${AUTH_B64}"
+              }
+            }
+          }
+          EOF
 
           /kaniko/executor \
             --context "${GITHUB_WORKSPACE}" \
             --dockerfile "${GITHUB_WORKSPACE}/Dockerfile" \
+            --destination "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${IMAGE_TAG}" \
+            --destination "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:latest"
             --destination "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:${IMAGE_TAG}" \
             --destination "${ACR_LOGIN_SERVER}/${IMAGE_NAME}:latest"
