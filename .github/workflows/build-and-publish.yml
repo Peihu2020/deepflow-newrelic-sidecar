@@ -15,6 +15,24 @@ jobs:
 
       - name: Authenticate to Azure via Managed Identity
         run: az login --identity
+        
+      - name: Diagnose Runner identity and ACR connectivity
+        env:
+          ACR_NAME: pocgithubacr
+          ACR_LOGIN_SERVER: pocgithubacr.azurecr.io
+        run: |
+          echo "=== Azure Account ==="
+          az account show --query "{name:name, id:id, tenantId:tenantId, user:user}" -o json || true
+
+          echo "=== Test ARM / AAD Token ==="
+          az account get-access-token --resource-type arm --query "{expiresOn:expiresOn, tokenType:tokenType}" -o json || true
+
+          echo "=== DNS & Proxy ==="
+          getent hosts "${ACR_LOGIN_SERVER}" || nslookup "${ACR_LOGIN_SERVER}" || true
+          env | grep -iE 'proxy|az_' || true
+
+          echo "=== Verbose ACR expose-token ==="
+          az acr login --name "${ACR_NAME}" --expose-token --debug || true
 
       - name: Verify Go toolchain
         run: go version
