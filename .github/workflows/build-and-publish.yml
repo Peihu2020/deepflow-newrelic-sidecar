@@ -21,9 +21,6 @@ jobs:
           echo "=== Current Account ==="
           az account show --output json
 
-          echo "=== List Accessible Subscriptions ==="
-          az account list --output table
-
           echo "=== Check ACR via ARM ==="
           az acr show \
             --name pocgithubacr \
