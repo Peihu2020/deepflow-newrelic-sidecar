@@ -1,0 +1,37 @@
+name: Build and Publish Go Project via ACA Runner
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-publish:
+    runs-on: [self-hosted, linux, aca-runner]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Azure via Managed Identity
+        run: az login --identity
+
+      - name: Verify Go toolchain
+        run: go version
+
+      - name: Build Go project
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o dist/app .
+
+      - name: Build and publish container image to Private ACR
+        env:
+          ACR_NAME: pocgithubacr
+          IMAGE_NAME: deepflow-newrelic-sidecar
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          az acr build \
+            --registry "$ACR_NAME" \
+            --image "${IMAGE_NAME}:${IMAGE_TAG}" \
+            --image "${IMAGE_NAME}:latest" \
+            .
