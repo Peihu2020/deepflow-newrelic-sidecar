@@ -1,4 +1,4 @@
-name: Build and Publish Go Project via ACA Runner
+name: Build and Publish Go Project via ACA Job Runner
 
 on:
   push:
