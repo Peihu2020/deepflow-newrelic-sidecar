@@ -18,9 +18,6 @@ jobs:
 
       - name: Debug ARM Identity and ACR Visibility
         run: |
-          echo "=== Current Account ==="
-          az account show --output json
-
           echo "=== Check ACR via ARM ==="
           az acr show \
             --name pocgithubacr \
